@@ -12,7 +12,7 @@ This file is the entry point. Keep it short and current. Detailed specifications
 
 ## Current state
 
-**Phase 3 — Nix store cache, S3 profile sync & WIP git bundles: complete (95.0% statement coverage). Ready to begin Phase 4 (In-Pod Bubble Tea TUI compositor, VT emulation & wizards).**
+**Phase 4 — Bubble Tea TUI compositor, PTY multiplexer & 60fps WebSocket server: complete (95.8% statement coverage). Ready to begin Phase 5 (Interactive Flake Init Wizard & Built-in AI Configurator).**
 
 See [`project-overview.md`](agent-docs/project-overview.md) for the eight build phases and their
 entry/completion criteria.
