@@ -16,6 +16,7 @@ import (
 // SplitLayout describes how panes in a repository tab are tiled.
 type SplitLayout string
 
+// Supported pane split tiling layouts.
 const (
 	LayoutVertical   SplitLayout = "vertical"
 	LayoutHorizontal SplitLayout = "horizontal"
@@ -24,6 +25,7 @@ const (
 // ModalKind identifies the currently active modal overlay in the compositor.
 type ModalKind string
 
+// Supported modal overlay kinds in the compositor.
 const (
 	ModalNone           ModalKind = ""
 	ModalToolLauncher   ModalKind = "tool_launcher"

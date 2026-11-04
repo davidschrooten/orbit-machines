@@ -137,6 +137,7 @@ func sanitizeDNSFragment(raw string) (cleaned string, lossless bool) {
 // ResourceTier defines the compute sizing tier granted to a user's Machine Pod.
 type ResourceTier string
 
+// Supported Machine Pod resource sizing tiers.
 const (
 	TierStandard    ResourceTier = "standard"
 	TierPerformance ResourceTier = "performance"
@@ -188,6 +189,7 @@ func (t ResourceTier) Specs() ResourceSpecs {
 // BootPhase represents the lifecycle stage of a Machine Pod during provisioning.
 type BootPhase string
 
+// Supported Machine Pod boot lifecycle phases.
 const (
 	PhaseScheduling       BootPhase = "scheduling"
 	PhaseHydratingProfile BootPhase = "hydrating_profile"

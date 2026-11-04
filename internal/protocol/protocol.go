@@ -26,13 +26,12 @@ var (
 // FrameType is the 1-byte header prefix on every binary WebSocket message.
 type FrameType byte
 
+// Binary WebSocket frame type headers for client-to-server (0x01-0x03) and server-to-client (0x10-0x13) messages.
 const (
-	// Client -> Server frames
 	FrameInput  FrameType = 0x01
 	FrameResize FrameType = 0x02
 	FramePing   FrameType = 0x03
 
-	// Server -> Client frames
 	FrameSnapshot FrameType = 0x10
 	FrameDiff     FrameType = 0x11
 	FramePong     FrameType = 0x12
@@ -42,6 +41,7 @@ const (
 // MetadataEventType classifies out-of-band 0x13 metadata events.
 type MetadataEventType string
 
+// Supported 0x13 out-of-band JSON metadata event types.
 const (
 	MetaEventBootProgress MetadataEventType = "boot_progress"
 	MetaEventIdleWarning  MetadataEventType = "idle_warning"
