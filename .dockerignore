@@ -1,0 +1,81 @@
+# Version control and Git worktrees
+.git
+.gitignore
+.github/
+.worktrees/
+worktrees/
+/tmp/
+
+# Build outputs, binaries, and local artifacts
+/bin/
+/dist/
+/build/
+/out/
+/vendor/
+/orbit-dispatcher
+/orbit-machined
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test, coverage, and profiling outputs
+*.test
+*.out
+*.prof
+*.pprof
+*.coverprofile
+coverage.*
+coverage.txt
+coverage.html
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Secrets, environment files, keys, and Kubernetes configs
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.age
+*.enc
+*.secret
+*.secrets
+secrets.yaml
+secrets.yml
+secrets.json
+credentials.json
+service-account*.json
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+.kube/
+
+# Nix & direnv artifacts
+result
+result-*
+.direnv/
+.envrc
+
+# Helm charts and documentation (not needed inside Go container build context)
+charts/
+agent-docs/
+AGENTS.md
+README.md
+.scratch/
+
+# Editor, IDE, and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
