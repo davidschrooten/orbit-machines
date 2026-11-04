@@ -21,15 +21,15 @@ func TestCodec_SignAndVerify_GoldenVector(t *testing.T) {
 	}
 
 	claims := ticket.Claims{
-		JTI:            "01960000-0000-7000-8000-000000000001",
-		Issuer:         ticket.ExpectedIssuer,
-		Subject:        "usr_42",
-		WorkspaceID:    "ws_99",
-		WorkspaceSlug:  "acme",
-		UserLogin:      "david",
-		Tier:           domain.TierPerformance,
-		IssuedAt:       1762264800,
-		ExpiresAt:      1762264860,
+		JTI:           "01960000-0000-7000-8000-000000000001",
+		Issuer:        ticket.ExpectedIssuer,
+		Subject:       "usr_42",
+		WorkspaceID:   "ws_99",
+		WorkspaceSlug: "acme",
+		UserLogin:     "david",
+		Tier:          domain.TierPerformance,
+		IssuedAt:      1762264800,
+		ExpiresAt:     1762264860,
 	}
 
 	token, err := codec.Sign(claims)

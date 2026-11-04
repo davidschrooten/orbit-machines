@@ -436,6 +436,3 @@ func TestErrorPathsAndEdgeCases(t *testing.T) {
 		t.Fatalf("expected Ask to fail when GetMachineConfig fails")
 	}
 }
-
-
-
