@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
 )
@@ -50,16 +51,19 @@ func TestDispatcherCLI_VersionAndServe(t *testing.T) {
 		}
 	})
 
-	t.Run("serve subcommand with default runner succeeds", func(t *testing.T) {
+	t.Run("serve subcommand with default runner starts and shuts down cleanly", func(t *testing.T) {
 		t.Parallel()
 		var out, errOut bytes.Buffer
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
 		args := []string{
 			"serve",
+			"--listen-addr=127.0.0.1:0",
 			"--orbit-url=https://orbit.acme.dev",
 			"--cluster-token=omc_live_0123456789abcdef0123456789",
 			"--ingress-host=machines.acme.dev",
 		}
-		code := run(context.Background(), args, &out, &errOut, nil)
+		code := run(ctx, args, &out, &errOut, nil)
 		if code != 0 {
 			t.Fatalf("run(serve default) code = %d, stderr = %s", code, errOut.String())
 		}

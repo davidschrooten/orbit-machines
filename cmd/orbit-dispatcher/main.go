@@ -4,14 +4,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
+	"github.com/davidschrooten/orbit-machines/internal/dispatcher"
+	"github.com/davidschrooten/orbit-machines/internal/k8s"
+	"github.com/davidschrooten/orbit-machines/internal/orbitclient"
+	"github.com/davidschrooten/orbit-machines/internal/protocol"
+	"github.com/davidschrooten/orbit-machines/internal/ticket"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -83,11 +92,55 @@ func NewRootCmd(stdout, stderr io.Writer, runner ServeRunner) *cobra.Command {
 func defaultServeRunner(logOut io.Writer) ServeRunner {
 	return func(ctx context.Context, cfg config.DispatcherConfig) error {
 		logger := slog.New(slog.NewJSONHandler(logOut, nil))
-		logger.InfoContext(ctx, "orbit-dispatcher configured",
-			slog.String("listen_addr", cfg.ListenAddr),
+		ticketCodec, _ := ticket.NewCodecFromClusterToken(cfg.ClusterToken)
+		frameCodec, _ := protocol.NewFrameCodec()
+		orbitClient, _ := orbitclient.NewClient(cfg.OrbitURL, cfg.ClusterToken)
+		orchestrator := k8s.NewFakePodOrchestrator(cfg.MaxConcurrentPods)
+
+		srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
+			ClusterToken:      cfg.ClusterToken,
+			MaxConcurrentPods: cfg.MaxConcurrentPods,
+			TicketCodec:       ticketCodec,
+			FrameCodec:        frameCodec,
+			Orchestrator:      orchestrator,
+			OrbitClient:       orbitClient,
+		})
+		if err != nil {
+			return err
+		}
+
+		ln, err := net.Listen("tcp", cfg.ListenAddr)
+		if err != nil {
+			return err
+		}
+		httpSrv := &http.Server{
+			Handler:           srv.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+
+		logger.InfoContext(ctx, "orbit-dispatcher listening",
+			slog.String("listen_addr", ln.Addr().String()),
 			slog.String("namespace", cfg.KubernetesNamespace),
 			slog.String("ingress_host", cfg.IngressHost),
 		)
-		return nil
+
+		errCh := make(chan error, 1)
+		go func() {
+			if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				errCh <- serveErr
+				return
+			}
+			errCh <- nil
+		}()
+
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutCtx)
+			return <-errCh
+		case serveErr := <-errCh:
+			return serveErr
+		}
 	}
 }
