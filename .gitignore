@@ -1,22 +1,54 @@
-# Binaries and build outputs
+# Go binaries, plugins, and build outputs
 /bin/
 /dist/
+/tmp/
+/vendor/
 /orbit-dispatcher
 /orbit-machined
 *.exe
-*.out
-*.test
+*.exe~
+*.dll
+*.so
+*.dylib
 
-# Coverage
+# Go test binaries, coverage, and pprof profiles
+*.test
+*.out
+*.prof
+*.coverprofile
+coverage.*
 coverage.txt
 coverage.html
 
-# Nix
+# Go workspace files
+go.work
+go.work.sum
+
+# Environment, credentials, and Kubernetes configs (never commit secrets)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+kubeconfig
+*.kubeconfig
+
+# Nix & direnv build/shell artifacts
 result
 result-*
 .direnv/
 
-# Editor / OS
-.DS_Store
+# Helm packaged charts
+charts/**/*.tgz
+charts/**/charts/
+
+# Local scratch & editor/OS files
+.scratch/
+.idea/
+.vscode/
 *.swp
+*.swo
 *~
+.DS_Store
+Thumbs.db
