@@ -59,7 +59,7 @@ git branch -d feat/dispatcher-pod-reconciler
 ## Definition of done for a phase
 
 A build phase is complete only when:
-- All package tests pass under `go test -race ./...`.
-- `golangci-lint run` reports zero issues.
+- All package unit and integration tests pass under `go test -race -coverprofile=coverage.txt ./...` with **at least 95% statement coverage**.
+- `golangci-lint run` (and `go vet ./...`) reports zero issues.
 - Any Helm chart changes pass `helm lint charts/orbit-machines` and `helm template`.
 - `AGENTS.md` is updated to reflect the completed phase.

@@ -12,7 +12,7 @@ This file is the entry point. Keep it short and current. Detailed specifications
 
 ## Current state
 
-**Phase 0 — Architecture & specification: complete. Ready to begin Phase 1 (Go foundation & protocol).**
+**Phase 1 — Go foundation, config & wire protocols: complete (97.6% statement coverage). Ready to begin Phase 2 (`orbit-dispatcher` gateway & Kubernetes Pod reconciler).**
 
 See [`project-overview.md`](agent-docs/project-overview.md) for the eight build phases and their
 entry/completion criteria.
