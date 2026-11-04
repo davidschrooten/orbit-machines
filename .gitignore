@@ -1,6 +1,8 @@
 # Go binaries, plugins, and build outputs
 /bin/
 /dist/
+/build/
+/out/
 /tmp/
 /vendor/
 /orbit-dispatcher
@@ -11,44 +13,94 @@
 *.so
 *.dylib
 
-# Go test binaries, coverage, and pprof profiles
+# Go test binaries, coverage reports, and pprof profiles
 *.test
 *.out
 *.prof
+*.pprof
 *.coverprofile
 coverage.*
 coverage.txt
 coverage.html
+cpu.prof
+mem.prof
+trace.out
 
 # Go workspace files
 go.work
 go.work.sum
 
-# Environment, credentials, and Kubernetes configs (never commit secrets)
+# Environment variables, credentials, keys, and Kubernetes configs (never commit secrets)
 .env
 .env.*
+*.env
 !.env.example
 *.pem
 *.key
 *.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.age
+*.enc
+*.secret
+*.secrets
+secrets.yaml
+secrets.yml
+secrets.json
+credentials.json
+service-account*.json
+*secret*.yaml
+*secret*.yml
+!charts/**/templates/*secret*.yaml
+!charts/**/templates/*secret*.yml
 kubeconfig
+kubeconfig.*
 *.kubeconfig
+.kube/
+
+# S3 / MinIO / Git WIP bundle artifacts
+*.bundle
+*.bundle.enc
+*.tar.zst
+*.tar.zst.enc
+*.nar
+*.nar.zst
+*.narinfo
 
 # Nix & direnv build/shell artifacts
 result
 result-*
 .direnv/
 
-# Helm packaged charts
+# Helm packaged charts and local overrides
 charts/**/*.tgz
 charts/**/charts/
+values.local.yaml
+values.override.yaml
+*.values.secret.yaml
 
-# Local scratch & editor/OS files
+# Git worktrees, scratchpads, and agent state
+.worktrees/
+worktrees/
 .scratch/
+.claude/
+.gemini/
+.opencode/
+
+# Editor, IDE, and OS files
 .idea/
 .vscode/
+*.iml
 *.swp
 *.swo
+*.swn
 *~
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
+Desktop.ini
