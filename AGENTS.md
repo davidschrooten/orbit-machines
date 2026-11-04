@@ -12,7 +12,7 @@ This file is the entry point. Keep it short and current. Detailed specifications
 
 ## Current state
 
-**Phase 2 — `orbit-dispatcher` gateway & Kubernetes Pod reconciler: complete (95.5% statement coverage). Ready to begin Phase 3 (Nix store cache, S3 profile sync & WIP git bundles).**
+**Phase 3 — Nix store cache, S3 profile sync & WIP git bundles: complete (95.0% statement coverage). Ready to begin Phase 4 (In-Pod Bubble Tea TUI compositor, VT emulation & wizards).**
 
 See [`project-overview.md`](agent-docs/project-overview.md) for the eight build phases and their
 entry/completion criteria.
