@@ -140,7 +140,7 @@ func TestServer_WebSocketTerminalBootAndSplice(t *testing.T) {
 	defer cancel()
 
 	wsURL := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + signedTicket
-	clientConn, _, err := websocket.Dial(ctx, wsURL, nil)
+	clientConn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		t.Fatalf("websocket.Dial gateway: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestServer_WebSocketEdgeCases(t *testing.T) {
 	defer cancel()
 
 	wsURL1 := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + t1
-	conn1, _, err := websocket.Dial(ctx, wsURL1, nil)
+	conn1, _, err := websocket.Dial(ctx, wsURL1, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		t.Fatalf("Dial 1: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestServer_WebSocketEdgeCases(t *testing.T) {
 		ExpiresAt:     now.Add(60 * time.Second).Unix(),
 	})
 	wsURL2 := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + t2
-	conn2, _, err := websocket.Dial(ctx, wsURL2, nil)
+	conn2, _, err := websocket.Dial(ctx, wsURL2, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		t.Fatalf("Dial 2: %v", err)
 	}

@@ -89,7 +89,7 @@ func TestSetShellProfileAndSyncProfileNow(t *testing.T) {
 
 	cfg := aiconfig.New(aiconfig.Options{
 		HomeDir: homeDir,
-		ProfileSyncer: func(ctx context.Context) error {
+		ProfileSyncer: func(_ context.Context) error {
 			synced++
 			return nil
 		},
@@ -134,7 +134,7 @@ func TestEditRepoFlake_ValidatesAndAtomicallyRollsBackOnError(t *testing.T) {
 	cfg := aiconfig.New(aiconfig.Options{
 		HomeDir: t.TempDir(),
 		RepoDir: repoDir,
-		FlakeValidator: func(ctx context.Context, dir string) error {
+		FlakeValidator: func(_ context.Context, dir string) error {
 			data, err := os.ReadFile(filepath.Join(dir, "flake.nix"))
 			if err != nil {
 				return err
@@ -225,10 +225,10 @@ func TestExecuteTool_DispatchesAllSixToolsAndHandlesErrors(t *testing.T) {
 	cfg := aiconfig.New(aiconfig.Options{
 		HomeDir: homeDir,
 		RepoDir: repoDir,
-		FlakeValidator: func(ctx context.Context, dir string) error {
+		FlakeValidator: func(_ context.Context, _ string) error {
 			return nil
 		},
-		ProfileSyncer: func(ctx context.Context) error {
+		ProfileSyncer: func(_ context.Context) error {
 			synced++
 			return nil
 		},
@@ -317,7 +317,7 @@ func TestAskAndView_ExecutesPlannerToolsAndRendersModal(t *testing.T) {
 	cfg := aiconfig.New(aiconfig.Options{
 		HomeDir: homeDir,
 		RepoDir: repoDir,
-		Planner: func(ctx context.Context, prompt string, state aiconfig.MachineConfigSnapshot) ([]aiconfig.ToolCall, string, error) {
+		Planner: func(_ context.Context, _ string, _ aiconfig.MachineConfigSnapshot) ([]aiconfig.ToolCall, string, error) {
 			return []aiconfig.ToolCall{
 				{
 					Name:      aiconfig.ToolUpdateTUIConfig,
@@ -384,13 +384,13 @@ func TestErrorPathsAndEdgeCases(t *testing.T) {
 		HomeDir:   t.TempDir(),
 		ConfigDir: cfgDir,
 		RepoDir:   repoDir,
-		FlakeValidator: func(ctx context.Context, dir string) error {
+		FlakeValidator: func(_ context.Context, _ string) error {
 			return errors.New("nix check failed")
 		},
-		ProfileSyncer: func(ctx context.Context) error {
+		ProfileSyncer: func(_ context.Context) error {
 			return errors.New("s3 upload failed")
 		},
-		Planner: func(ctx context.Context, prompt string, state aiconfig.MachineConfigSnapshot) ([]aiconfig.ToolCall, string, error) {
+		Planner: func(_ context.Context, prompt string, _ aiconfig.MachineConfigSnapshot) ([]aiconfig.ToolCall, string, error) {
 			if prompt == "plan-error" {
 				return nil, "", errors.New("llm unavailable")
 			}

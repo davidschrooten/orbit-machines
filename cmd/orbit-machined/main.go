@@ -107,9 +107,7 @@ func collectStorePaths(args []string, envOutPaths string) []string {
 			out = append(out, trimmed)
 		}
 	}
-	for _, p := range strings.Fields(envOutPaths) {
-		out = append(out, p)
-	}
+	out = append(out, strings.Fields(envOutPaths)...)
 	return out
 }
 

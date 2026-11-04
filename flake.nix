@@ -54,7 +54,6 @@
             pkgs.ripgrep
             pkgs.kubectl
             pkgs.kubernetes-helm
-            pkgs.minio-client
             pkgs.direnv
           ];
 

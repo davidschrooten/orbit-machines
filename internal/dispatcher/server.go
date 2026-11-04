@@ -213,7 +213,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	podConn, _, err := websocket.Dial(sessCtx, ep.WebSocketURL, nil)
+	podConn, _, err := websocket.Dial(sessCtx, ep.WebSocketURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		_ = clientConn.Close(websocket.StatusBadGateway, "unable to dial pod websocket")
 		return

@@ -180,7 +180,7 @@ func TestCompositor_LeaderChordsSplitZoomFocusTabsAndModals(t *testing.T) {
 	if !strings.Contains(comp.View(), "Restore Uncommitted WIP Bundle") {
 		t.Fatalf("expected WIP Restore modal in View()")
 	}
-	comp.SetModalRenderer(tui.ModalWIPRestore, func(w, h int) string {
+	comp.SetModalRenderer(tui.ModalWIPRestore, func(_, _ int) string {
 		return "CUSTOM_WIP_MODAL"
 	})
 	if !strings.Contains(comp.View(), "CUSTOM_WIP_MODAL") {
@@ -250,7 +250,7 @@ func TestWSServer_60fpsDiffCoalescingSnapshotPingAndMetadata(t *testing.T) {
 	defer cancel()
 
 	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/ws"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		t.Fatalf("websocket.Dial: %v", err)
 	}
