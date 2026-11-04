@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test -race ./...
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/orbit-dispatcher-linux-amd64 ./cmd/orbit-dispatcher
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/orbit-dispatcher-linux-arm64 ./cmd/orbit-dispatcher
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/orbit-dispatcher-darwin-amd64 ./cmd/orbit-dispatcher
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/orbit-dispatcher-darwin-arm64 ./cmd/orbit-dispatcher
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/orbit-machined-linux-amd64 ./cmd/orbit-machined
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/orbit-machined-linux-arm64 ./cmd/orbit-machined
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/orbit-machined-darwin-amd64 ./cmd/orbit-machined
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/orbit-machined-darwin-arm64 ./cmd/orbit-machined
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/orbit-dispatcher-linux-amd64
+            dist/orbit-dispatcher-linux-arm64
+            dist/orbit-dispatcher-darwin-amd64
+            dist/orbit-dispatcher-darwin-arm64
+            dist/orbit-machined-linux-amd64
+            dist/orbit-machined-linux-arm64
+            dist/orbit-machined-darwin-amd64
+            dist/orbit-machined-darwin-arm64
+            dist/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
