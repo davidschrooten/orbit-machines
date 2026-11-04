@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+    branches: ["master", "main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Vet, Test & Coverage Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Verify gofmt formatting
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -s -d .
+            exit 1
+          fi
+
+      - name: Run tests with race detector and coverage
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage gate (>= 95%)
+        run: |
+          pct=$(go tool cover -func=coverage.out | tail -n1 | awk '{print $3}' | tr -d '%')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 95) ? 0 : 1 }' || {
+            echo "coverage $pct% < 95%"; exit 1;
+          }
+
+      - name: Per-function coverage report
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            go tool cover -func=coverage.out > coverage.txt
+            echo "wrote coverage.txt ($(wc -l < coverage.txt) lines)"
+          fi
+
+      - name: HTML coverage report
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            go tool cover -html=coverage.out -o coverage.html
+            echo "wrote coverage.html"
+          fi
+
+      - name: Per-package coverage summary
+        if: always()
+        run: |
+          if [ ! -f coverage.out ]; then exit 0; fi
+          awk '
+            NR == 1 { next }
+            {
+              key = $1; stmts = $2; cnt = $3
+              if (!(key in seen)) { seen[key] = 1; block_stmts[key] = stmts }
+              if (cnt > block_cnt[key]) block_cnt[key] = cnt
+            }
+            END {
+              for (key in seen) {
+                split(key, a, ":")
+                file = a[1]
+                n = split(file, parts, "/")
+                pkg = ""
+                for (i = 1; i < n; i++) {
+                  if (i > 1) pkg = pkg "/"
+                  pkg = pkg parts[i]
+                }
+                total[pkg] += block_stmts[key]
+                if (block_cnt[key] > 0) covered[pkg] += block_stmts[key]
+              }
+              for (p in total) {
+                pct = 0
+                if (total[p] > 0) pct = 100.0 * covered[p] / total[p]
+                printf "%-70s %5.1f%%  (%d/%d statements)\n", p, pct, covered[p], total[p]
+              }
+            }
+          ' coverage.out | sort > coverage-by-package.txt
+          echo "--- per-package coverage ---"
+          cat coverage-by-package.txt
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+            coverage-by-package.txt
+          if-no-files-found: ignore
+
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build multi-platform binaries
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
+              -o "dist/orbit-dispatcher-${os}-${arch}" ./cmd/orbit-dispatcher
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
+              -o "dist/orbit-machined-${os}-${arch}" ./cmd/orbit-machined
+          done
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum orbit-dispatcher-* orbit-machined-* > checksums.txt
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbit-machines-binaries
+          path: |
+            dist/orbit-dispatcher-*
+            dist/orbit-machined-*
+            dist/checksums.txt
+          if-no-files-found: error
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
