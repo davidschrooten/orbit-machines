@@ -1,0 +1,17 @@
+apiVersion: v2
+name: orbit-machines
+description: Production Helm chart for Orbit Machines (orbit-dispatcher Kubernetes gateway, ephemeral Nix Machine Pod RBAC/NetworkPolicy, and optional in-cluster MinIO object storage)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: https://raw.githubusercontent.com/davidschrooten/orbit-machines/master/docs/icon.svg
+keywords:
+  - orbit
+  - orbit-machines
+  - kubernetes
+  - nix
+  - cloud-shell
+  - agentic-development
+maintainers:
+  - name: David Schrooten
+    url: https://github.com/davidschrooten

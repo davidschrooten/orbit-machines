@@ -1,0 +1,34 @@
+{{- if .Values.dispatcher.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "orbit-machines.fullname" . }}-dispatcher
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "orbit-machines.labels" . | nindent 4 }}
+  {{- with .Values.dispatcher.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.dispatcher.ingress.className }}
+  ingressClassName: {{ .Values.dispatcher.ingress.className | quote }}
+  {{- end }}
+  {{- if .Values.dispatcher.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.dispatcher.ingress.host | quote }}
+      secretName: {{ .Values.dispatcher.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.dispatcher.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "orbit-machines.fullname" . }}-dispatcher
+                port:
+                  number: {{ .Values.dispatcher.service.port }}
+{{- end }}

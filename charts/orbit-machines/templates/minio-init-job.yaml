@@ -1,0 +1,147 @@
+{{- if .Values.s3.minio.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orbit-machines.fullname" . }}-minio
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "orbit-machines.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  type: ClusterIP
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ include "orbit-machines.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: minio
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "orbit-machines.fullname" . }}-minio
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "orbit-machines.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  serviceName: {{ include "orbit-machines.fullname" . }}-minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "orbit-machines.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "orbit-machines.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: minio
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: "{{ .Values.s3.minio.image.repository }}:{{ .Values.s3.minio.image.tag }}"
+          imagePullPolicy: {{ .Values.s3.minio.image.pullPolicy }}
+          args:
+            - "server"
+            - "/data"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbit-machines.secretName" . }}
+                  key: s3-access-key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbit-machines.secretName" . }}
+                  key: s3-secret-key
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.s3.minio.persistence.size | quote }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "orbit-machines.fullname" . }}-minio-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "orbit-machines.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-init
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "orbit-machines.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: minio-init
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: mc-init
+          image: "{{ .Values.s3.minio.mcImage.repository }}:{{ .Values.s3.minio.mcImage.tag }}"
+          imagePullPolicy: {{ .Values.s3.minio.mcImage.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: MINIO_ENDPOINT
+              value: {{ include "orbit-machines.s3Endpoint" . | quote }}
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbit-machines.secretName" . }}
+                  key: s3-access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbit-machines.secretName" . }}
+                  key: s3-secret-key
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              mc alias set orbit "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
+              mc mb --ignore-existing "orbit/{{ .Values.s3.vaultBucket }}"
+              mc mb --ignore-existing "orbit/{{ .Values.s3.gitWipBucket }}"
+              mc mb --ignore-existing "orbit/{{ .Values.s3.nixCacheBucket }}"
+              mc mb --ignore-existing "orbit/{{ .Values.s3.profileBucket }}"
+{{- end }}
