@@ -1,0 +1,59 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "orbit-machines.fullname" . }}-machine-pod-isolation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "orbit-machines.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: machine-pod
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: dispatcher
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow DNS resolution via kube-dns / CoreDNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow S3 / MinIO object storage access inside the namespace
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- if .Values.networkPolicy.allowClusterAPIServer }}
+    # Allow egress to the Kubernetes API server when enabled
+    - ports:
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+    # Allow public HTTPS and SSH egress while blocking cloud metadata and RFC1918 lateral traffic
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 22
+{{- end }}

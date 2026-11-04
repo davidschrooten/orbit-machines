@@ -1,0 +1,105 @@
+# Default values for orbit-machines.
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a ServiceAccount should be created for orbit-dispatcher.
+  create: true
+  # Annotations to add to the ServiceAccount.
+  annotations: {}
+  # The name of the ServiceAccount to use. If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+dispatcher:
+  # Number of stateless orbit-dispatcher replicas.
+  replicaCount: 1
+  image:
+    repository: ghcr.io/davidschrooten/orbit-dispatcher
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8080
+  ingress:
+    enabled: false
+    className: "nginx"
+    host: "machines.orbit.example.com"
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    tls:
+      enabled: true
+      secretName: "orbit-machines-tls"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  maxConcurrentPods: 25
+  idleTimeout: "30m"
+  reconcileInterval: "60s"
+  heartbeatInterval: "30s"
+
+machined:
+  image:
+    repository: ghcr.io/davidschrooten/orbit-machined
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  defaultCPU: "2"
+  defaultMemory: "4Gi"
+  workspaceStorage: "20Gi"
+  nixStoreStorage: "20Gi"
+  security:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    allowPrivilegeEscalation: false
+    runtimeClassName: ""
+
+orbit:
+  # Base URL of the Orbit Rails control plane.
+  url: "https://orbit.example.com"
+  # Unique cluster identifier registered in Orbit.
+  clusterId: "cluster-default"
+  # Shared cluster bearer token (omc_live_...). Ignored when existingSecret is set.
+  clusterToken: "omc_live_default_placeholder_token_32chars"
+  # Ed25519 public key (hex or base64) used to verify Orbit session tickets.
+  signingPublicKey: ""
+  # Optional Ed25519 private key for cluster-signed artifacts/cache derivations.
+  signingPrivateKey: ""
+  # Name of an existing Kubernetes Secret containing cluster credentials.
+  existingSecret: ""
+
+s3:
+  # S3/MinIO endpoint URL. When empty and s3.minio.enabled is true, defaults to the in-cluster MinIO service.
+  endpoint: ""
+  region: "us-east-1"
+  accessKey: "orbit-minio-admin"
+  secretKey: "orbit-minio-secret-key"
+  usePathStyle: true
+  vaultBucket: "orbit-vaults"
+  gitWipBucket: "orbit-git-wip"
+  nixCacheBucket: "orbit-nix-cache"
+  profileBucket: "orbit-user-profiles"
+  minio:
+    enabled: true
+    image:
+      repository: quay.io/minio/minio
+      tag: "RELEASE.2025-02-18T16-25-55Z"
+      pullPolicy: IfNotPresent
+    mcImage:
+      repository: quay.io/minio/mc
+      tag: "RELEASE.2025-02-15T10-36-16Z"
+      pullPolicy: IfNotPresent
+    persistence:
+      size: "50Gi"
+
+networkPolicy:
+  # Isolate dynamic machine-pod workloads from lateral pod-to-pod traffic.
+  enabled: true
+  # Allow machine-pod egress to the Kubernetes API server if needed.
+  allowClusterAPIServer: true
