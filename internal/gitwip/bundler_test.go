@@ -116,8 +116,8 @@ func TestBundler_CleanDirtySnapshotAndRestoreLifecycle(t *testing.T) {
 
 	// Verify committed file from git bundle, modified tracked file, and untracked file are all present.
 	for rel, want := range map[string]string{
-		"committed.go":             "package main\n",
-		"README.md":                "# Orbit Modified\n",
+		"committed.go":              "package main\n",
+		"README.md":                 "# Orbit Modified\n",
 		"internal/pkg/untracked.go": "package pkg\n",
 	} {
 		got, err := os.ReadFile(filepath.Join(restoredDir, rel))
@@ -171,4 +171,3 @@ func TestBundler_CleanDirtySnapshotAndRestoreLifecycle(t *testing.T) {
 		t.Fatalf("expected ErrUnsafeArchiveEntry on zip-slip WIP bundle, got %v", err)
 	}
 }
-

@@ -335,4 +335,3 @@ func TestStorage_MemoryStoreAndErrorPaths(t *testing.T) {
 	_ = httpStore.DeleteObject(canceledCtx, "b", "k")
 	_, _ = httpStore.ListObjects(canceledCtx, "b", "p")
 }
-

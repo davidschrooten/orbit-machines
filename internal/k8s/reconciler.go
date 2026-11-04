@@ -86,11 +86,11 @@ type ManifestConfig struct {
 
 // PodManifest is a lightweight JSON-serializable representation of a Kubernetes core/v1 Pod.
 type PodManifest struct {
-	APIVersion string      `json:"apiVersion"`
-	Kind       string      `json:"kind"`
-	Metadata   ObjectMeta  `json:"metadata"`
-	Spec       PodSpec     `json:"spec"`
-	Status     PodStatus   `json:"status,omitempty"`
+	APIVersion string     `json:"apiVersion"`
+	Kind       string     `json:"kind"`
+	Metadata   ObjectMeta `json:"metadata"`
+	Spec       PodSpec    `json:"spec"`
+	Status     PodStatus  `json:"status,omitempty"`
 }
 
 // PodList is a core/v1 PodList response.

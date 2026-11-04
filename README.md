@@ -8,7 +8,7 @@
   <a href="https://github.com/davidschrooten/orbit-machines/actions/workflows/ci.yml"><img src="https://github.com/davidschrooten/orbit-machines/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI Status"></a>
   <a href="https://github.com/davidschrooten/orbit-machines/actions/workflows/release.yml"><img src="https://github.com/davidschrooten/orbit-machines/actions/workflows/release.yml/badge.svg" alt="Release Workflow"></a>
   <a href="go.mod"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white" alt="Go Version"></a>
-  <a href="Makefile"><img src="https://img.shields.io/badge/coverage-95.8%25-brightgreen" alt="Statement Coverage"></a>
+  <a href="Makefile"><img src="https://img.shields.io/badge/coverage-96.2%25-brightgreen" alt="Statement Coverage"></a>
   <a href="flake.nix"><img src="https://img.shields.io/badge/Nix-Flake-5277C3?logo=nixos&logoColor=white" alt="Nix Flake"></a>
   <a href="charts/orbit-machines"><img src="https://img.shields.io/badge/Helm-Chart-0F1689?logo=helm&logoColor=white" alt="Kubernetes Helm Chart"></a>
 </p>

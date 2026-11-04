@@ -12,7 +12,7 @@ This file is the entry point. Keep it short and current. Detailed specifications
 
 ## Current state
 
-**Phase 4 — Bubble Tea TUI compositor, PTY multiplexer & 60fps WebSocket server: complete (95.8% statement coverage). Ready to begin Phase 5 (Interactive Flake Init Wizard & Built-in AI Configurator).**
+**Phases 1–6 — Complete in `orbit-machines` (96.2% total statement coverage across all 18 packages, plus production Kubernetes Helm chart, Nix flake, Makefile, and GitHub Actions CI/Release workflows). Ready for Phases 7 & 8 in `orbit/`.**
 
 See [`project-overview.md`](agent-docs/project-overview.md) for the eight build phases and their
 entry/completion criteria.

@@ -402,4 +402,3 @@ func TestServer_WebSocketEdgeCases(t *testing.T) {
 		t.Fatalf("expected connection 2 to close when cluster capacity is reached")
 	}
 }
-

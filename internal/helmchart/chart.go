@@ -90,9 +90,9 @@ type ImageSpec struct {
 
 // DispatcherValues holds the dispatcher section of values.yaml.
 type DispatcherValues struct {
-	ReplicaCount      int       `yaml:"replicaCount"`
-	Image             ImageSpec `yaml:"image"`
-	Service           struct {
+	ReplicaCount int       `yaml:"replicaCount"`
+	Image        ImageSpec `yaml:"image"`
+	Service      struct {
 		Type string `yaml:"type"`
 		Port int    `yaml:"port"`
 	} `yaml:"service"`
