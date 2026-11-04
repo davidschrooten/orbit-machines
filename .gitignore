@@ -1,0 +1,22 @@
+# Binaries and build outputs
+/bin/
+/dist/
+/orbit-dispatcher
+/orbit-machined
+*.exe
+*.out
+*.test
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Nix
+result
+result-*
+.direnv/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
