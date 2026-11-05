@@ -471,10 +471,15 @@ func buildDirenvTOML(workDir string) string {
 func buildBashrcBlock(homeDir string) string {
 	starshipCfg := filepath.Join(homeDir, ".config", "starship.toml")
 	envSh := filepath.Join(homeDir, ".config", "orbit", "env.sh")
+	sshKeyPath := filepath.Join(homeDir, ".ssh", "id_ed25519")
+	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
+	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	return fmt.Sprintf(`%s
 export STARSHIP_CONFIG=%q
 export COLORTERM="truecolor"
 export TERM="${TERM:-xterm-256color}"
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND=%q
 [ -f %q ] && . %q
 command -v direnv >/dev/null 2>&1 && eval "$(direnv hook bash)"
 command -v starship >/dev/null 2>&1 && eval "$(starship init bash)"
@@ -491,5 +496,5 @@ if [[ $- == *i* ]]; then
   printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n\n'
 fi
 %s
-`, bashrcMarkerStart, starshipCfg, envSh, envSh, bashrcMarkerEnd)
+`, bashrcMarkerStart, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
 }

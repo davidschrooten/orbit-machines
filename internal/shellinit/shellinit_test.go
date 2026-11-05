@@ -103,6 +103,8 @@ func TestEnsureInitialized_WritesStarshipJetpackDirenvAndWelcomeBashrc(t *testin
 		`eval "$(direnv hook bash)"`,
 		`eval "$(starship init bash)"`,
 		"STARSHIP_CONFIG",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_SSH_COMMAND=",
 		"if [[ $- == *i* ]]; then",
 		"Welcome to Orbit Machine",
 		"orbit repos",

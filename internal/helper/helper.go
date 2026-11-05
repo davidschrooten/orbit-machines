@@ -36,6 +36,8 @@ import (
 // SupportedTools lists all developer and AI tools configurable by orbit-helper.
 var SupportedTools = []string{"claude", "agy", "opencode", "gh", "git"}
 
+const gitSSHMarker = "# orbit-git-ssh: v1"
+
 // GitCloner clones or updates a Git repository into destDir.
 type GitCloner func(ctx context.Context, cloneURL, destDir, branch string) error
 
@@ -166,7 +168,9 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 	cloner := cfg.GitCloner
 	if cloner == nil {
-		cloner = defaultGitCloner
+		cloner = func(ctx context.Context, cloneURL, destDir, branch string) error {
+			return defaultGitClonerWithHome(ctx, homeDir, cloneURL, destDir, branch)
+		}
 	}
 	allower := cfg.DirenvAllower
 	if allower == nil {
@@ -262,7 +266,7 @@ func (m *Manager) ConfigureGit(name, email, defaultBranch string) error {
 		defaultBranch = "main"
 	}
 
-	gitCfg := formatGitConfig(name, email, defaultBranch)
+	gitCfg := formatGitConfig(m.homeDir, name, email, defaultBranch)
 	if err := writeConfigFile(filepath.Join(m.homeDir, ".gitconfig"), []byte(gitCfg), 0o644); err != nil {
 		return err
 	}
@@ -277,16 +281,17 @@ func (m *Manager) ConfigureGit(name, email, defaultBranch string) error {
 	return m.SaveState(st)
 }
 
-// EnsureGitAndSSH ensures ~/.gitconfig is initialized (restoring from State.Git or Orbit user defaults)
+// EnsureGitAndSSH ensures ~/.gitconfig is initialized with SSH key rules (restoring from State.Git or Orbit user defaults)
 // and restores ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, and ~/.ssh/config if saved in State.SSHKey.
 func (m *Manager) EnsureGitAndSSH() error {
 	st, _ := m.LoadState()
 	orbitCtx, _ := m.LoadContext()
 
 	gitConfigPath := filepath.Join(m.homeDir, ".gitconfig")
-	if _, err := os.Stat(gitConfigPath); os.IsNotExist(err) {
+	existingGit, gitErr := os.ReadFile(gitConfigPath)
+	if gitErr != nil || !strings.Contains(string(existingGit), gitSSHMarker) {
 		name, email, branch := m.defaultGitIdentity(st, orbitCtx)
-		gitCfg := formatGitConfig(name, email, branch)
+		gitCfg := formatGitConfig(m.homeDir, name, email, branch)
 		if err := writeConfigFile(gitConfigPath, []byte(gitCfg), 0o644); err != nil {
 			return err
 		}
@@ -301,11 +306,8 @@ func (m *Manager) EnsureGitAndSSH() error {
 	}
 
 	if st.SSHKey != nil && strings.TrimSpace(st.SSHKey.PrivateKey) != "" {
-		privPath := filepath.Join(m.homeDir, ".ssh", "id_ed25519")
-		if _, err := os.Stat(privPath); os.IsNotExist(err) {
-			if err := m.writeSSHFiles(st.SSHKey.PrivateKey, st.SSHKey.PublicKey); err != nil {
-				return err
-			}
+		if err := m.writeSSHFiles(st.SSHKey.PrivateKey, st.SSHKey.PublicKey); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -336,13 +338,16 @@ func (m *Manager) GenerateSSHKey(comment string) (SSHKeyConfig, error) {
 	st, _ := m.LoadState()
 	st.SSHKey = &cfg
 	_ = m.SaveState(st)
+	_ = m.EnsureGitAndSSH()
 	return cfg, nil
 }
 
 // SetSSHKey validates an existing SSH private key PEM, derives its public key, writes
 // ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, and ~/.ssh/config, and persists it in State.
 func (m *Manager) SetSSHKey(privateKeyPEM string) (SSHKeyConfig, error) {
-	trimmed := strings.TrimSpace(privateKeyPEM)
+	cleaned := strings.ReplaceAll(privateKeyPEM, "\r\n", "\n")
+	cleaned = strings.ReplaceAll(cleaned, "\r", "\n")
+	trimmed := strings.TrimSpace(cleaned)
 	if trimmed == "" {
 		return SSHKeyConfig{}, fmt.Errorf("%w: SSH private key is required", domain.ErrInvalidConfig)
 	}
@@ -364,6 +369,7 @@ func (m *Manager) SetSSHKey(privateKeyPEM string) (SSHKeyConfig, error) {
 	st, _ := m.LoadState()
 	st.SSHKey = &cfg
 	_ = m.SaveState(st)
+	_ = m.EnsureGitAndSSH()
 	return cfg, nil
 }
 
@@ -385,17 +391,25 @@ func (m *Manager) writeSSHFiles(privPEM, pubAuth string) error {
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		return fmt.Errorf("creating ~/.ssh: %w", err)
 	}
+	_ = os.Chmod(sshDir, 0o700)
 	privPath := filepath.Join(sshDir, "id_ed25519")
 	if err := os.WriteFile(privPath, []byte(strings.TrimSpace(privPEM)+"\n"), 0o600); err != nil {
 		return fmt.Errorf("writing id_ed25519: %w", err)
 	}
+	_ = os.Chmod(privPath, 0o600)
 	if strings.TrimSpace(pubAuth) != "" {
 		pubPath := filepath.Join(sshDir, "id_ed25519.pub")
 		_ = os.WriteFile(pubPath, []byte(strings.TrimSpace(pubAuth)+"\n"), 0o644)
+		_ = os.Chmod(pubPath, 0o644)
 	}
+	knownHostsPath := filepath.Join(sshDir, "known_hosts")
 	sshConfigPath := filepath.Join(sshDir, "config")
-	sshConfig := fmt.Sprintf("Host *\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n", privPath)
-	return os.WriteFile(sshConfigPath, []byte(sshConfig), 0o600)
+	sshConfig := fmt.Sprintf("Host *\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s\n", privPath, knownHostsPath)
+	if err := os.WriteFile(sshConfigPath, []byte(sshConfig), 0o600); err != nil {
+		return err
+	}
+	_ = os.Chmod(sshConfigPath, 0o600)
+	return nil
 }
 
 func (m *Manager) defaultGitIdentity(st State, orbitCtx OrbitContext) (string, string, string) {
@@ -415,9 +429,32 @@ func (m *Manager) defaultGitIdentity(st State, orbitCtx OrbitContext) (string, s
 	return login, login + "@users.noreply.orbit.local", "main"
 }
 
-func formatGitConfig(name, email, branch string) string {
+func formatGitConfig(homeDir, name, email, branch string) string {
 	branch = fallbackStr(branch, "main")
-	return fmt.Sprintf("[user]\n\tname = %s\n\temail = %s\n[init]\n\tdefaultBranch = %s\n[pull]\n\trebase = false\n[safe]\n\tdirectory = *\n[credential]\n\thelper = store\n", name, email, branch)
+	sshKeyPath := filepath.Join(homeDir, ".ssh", "id_ed25519")
+	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
+	return fmt.Sprintf(`%s
+[user]
+	name = %s
+	email = %s
+[init]
+	defaultBranch = %s
+[pull]
+	rebase = false
+[safe]
+	directory = *
+[core]
+	sshCommand = ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s
+[url "git@github.com:"]
+	insteadOf = https://github.com/
+	insteadOf = http://github.com/
+[url "git@gitlab.com:"]
+	insteadOf = https://gitlab.com/
+	insteadOf = http://gitlab.com/
+[url "git@bitbucket.org:"]
+	insteadOf = https://bitbucket.org/
+	insteadOf = http://bitbucket.org/
+`, gitSSHMarker, name, email, branch, sshKeyPath, knownHostsPath)
 }
 
 // CloneRepositories clones selected (or all) repositories into WorkDir and configures Nix flake auto-loading.
@@ -626,11 +663,11 @@ func (m *Manager) ConfigureTools(selected []string) ([]string, error) {
 		case "aider":
 			files[filepath.Join(m.homeDir, ".aider.conf.yml")] = fileSpec{[]byte("auto-commits: false\n"), 0o600}
 		case "gh":
-			ghYML := []byte("git_protocol: https\neditor: vim\nprompt: enabled\n")
+			ghYML := []byte("git_protocol: ssh\neditor: vim\nprompt: enabled\n")
 			files[filepath.Join(m.homeDir, ".config", "gh", "config.yml")] = fileSpec{ghYML, 0o600}
 		case "git":
 			name, email, branch := m.defaultGitIdentity(st, orbitCtx)
-			gitCfg := formatGitConfig(name, email, branch)
+			gitCfg := formatGitConfig(m.homeDir, name, email, branch)
 			files[filepath.Join(m.homeDir, ".gitconfig")] = fileSpec{[]byte(gitCfg), 0o644}
 			st.Git = &GitConfig{
 				UserName:      name,
@@ -759,7 +796,7 @@ func (m *Manager) runInteractiveSSHKeyWithScanner(scanner *bufio.Scanner, out io
 		_, _ = fmt.Fprintln(out, "Paste your SSH private key (end with -----END ... PRIVATE KEY-----):")
 		var lines []string
 		for scanner.Scan() {
-			line := scanner.Text()
+			line := strings.ReplaceAll(scanner.Text(), "\r", "")
 			lines = append(lines, line)
 			if strings.Contains(line, "-----END ") && strings.Contains(line, "PRIVATE KEY-----") {
 				break
@@ -810,7 +847,7 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 			if len(orbitCtx.Repositories) > 0 {
 				_, _ = fmt.Fprintln(out, "\nAvailable workspace repositories:")
 				for i, r := range orbitCtx.Repositories {
-					_, _ = fmt.Fprintf(out, "  [%d] %s (%s)\n", i+1, r.Name, r.CloneURL)
+					_, _ = fmt.Fprintf(out, "  [%d] %s (%s)\n", i+1, r.Name, ToSSHCloneURL(r.CloneURL))
 				}
 			}
 			_, _ = fmt.Fprint(out, "Enter repo name/URL, comma-separated numbers, or 'all' [all]: ")
@@ -870,7 +907,7 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 			_, _ = fmt.Fprintln(out, "  [2] agy       — Antigravity CLI (wired to Orbit MCP)")
 			_, _ = fmt.Fprintln(out, "  [3] opencode  — OpenCode CLI (wired to Orbit MCP)")
 			_, _ = fmt.Fprintln(out, "  [4] gh        — GitHub CLI configuration")
-			_, _ = fmt.Fprintln(out, "  [5] git       — Git identity & credential helper")
+			_, _ = fmt.Fprintln(out, "  [5] git       — Git identity & SSH configuration")
 			_, _ = fmt.Fprint(out, "Select tools [all]: ")
 			rawSel := "all"
 			if scanner.Scan() && strings.TrimSpace(scanner.Text()) != "" {
@@ -1015,12 +1052,31 @@ func deriveSSHPublicKey(privPEM string) (string, error) {
 		}
 	}
 
+	// 3. Fallback to ssh-keygen -y -f for RSA, ECDSA, and other OpenSSH-supported private key formats
+	if sshKeygenPath, lookErr := exec.LookPath("ssh-keygen"); lookErr == nil {
+		if tmpFile, tmpErr := os.CreateTemp("", "orbit-ssh-key-*"); tmpErr == nil {
+			tmpPath := tmpFile.Name()
+			defer func() { _ = os.Remove(tmpPath) }()
+			_ = tmpFile.Chmod(0o600)
+			_, _ = tmpFile.WriteString(strings.TrimSpace(privPEM) + "\n")
+			_ = tmpFile.Close()
+			if out, cmdErr := exec.Command(sshKeygenPath, "-P", "", "-y", "-f", tmpPath).Output(); cmdErr == nil && strings.TrimSpace(string(out)) != "" {
+				return strings.TrimSpace(string(out)) + "\n", nil
+			}
+		}
+	}
+
 	return "", fmt.Errorf("%w: unsupported SSH private key format", domain.ErrInvalidConfig)
 }
 
 func (m *Manager) writeEnvSh(ctxData OrbitContext) error {
 	var b strings.Builder
 	b.WriteString("# Generated by orbit-helper — sourced by ~/.bashrc\n")
+	sshKeyPath := filepath.Join(m.homeDir, ".ssh", "id_ed25519")
+	knownHostsPath := filepath.Join(m.homeDir, ".ssh", "known_hosts")
+	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
+	b.WriteString("export GIT_TERMINAL_PROMPT=0\n")
+	_, _ = fmt.Fprintf(&b, "export GIT_SSH_COMMAND=%q\n", sshCmd)
 	for _, kv := range [][2]string{
 		{"ORBIT_URL", ctxData.OrbitURL},
 		{"ORBIT_MCP_TOKEN", ctxData.OrbitMCPToken},
@@ -1081,7 +1137,7 @@ func normalizeToolSelection(raw []string) []string {
 
 func matchRepo(repos []protocol.RepoCredential, query string) (protocol.RepoCredential, bool) {
 	for _, r := range repos {
-		if strings.EqualFold(r.Name, query) || strings.EqualFold(r.ID, query) || strings.EqualFold(r.CloneURL, query) {
+		if strings.EqualFold(r.Name, query) || strings.EqualFold(r.ID, query) || strings.EqualFold(r.CloneURL, query) || strings.EqualFold(ToSSHCloneURL(r.CloneURL), query) {
 			return r, true
 		}
 	}
@@ -1099,27 +1155,61 @@ func repoNameFromURL(rawURL string) string {
 	return cleaned
 }
 
-func buildAuthenticatedCloneURL(repo protocol.RepoCredential) string {
-	rawURL := strings.TrimSpace(repo.CloneURL)
-	token := strings.TrimSpace(repo.GitToken)
-	if token == "" {
-		return rawURL
+// ToSSHCloneURL converts remote HTTP(S) Git repository URLs (e.g. https://github.com/owner/repo.git)
+// to SSH clone URLs (e.g. git@github.com:owner/repo.git) so Git always authenticates via SSH keys
+// and never prompts for an HTTPS username/password. Local filesystem paths and SSH URLs are returned as-is.
+func ToSSHCloneURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		return trimmed
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return rawURL
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed == nil {
+		return trimmed
 	}
-	user := strings.TrimSpace(repo.GitUsername)
-	if user == "" {
-		user = "x-access-token"
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return trimmed
 	}
-	parsed.User = url.UserPassword(user, token)
-	return parsed.String()
+	repoPath := strings.Trim(parsed.Path, "/")
+	if repoPath == "" {
+		return trimmed
+	}
+	if !strings.HasSuffix(repoPath, ".git") {
+		repoPath += ".git"
+	}
+	return fmt.Sprintf("git@%s:%s", parsed.Hostname(), repoPath)
 }
 
-func defaultGitCloner(ctx context.Context, cloneURL, destDir, branch string) error {
+func buildAuthenticatedCloneURL(repo protocol.RepoCredential) string {
+	return ToSSHCloneURL(repo.CloneURL)
+}
+
+func gitEnvForHome(homeDir string) []string {
+	env := append([]string(nil), os.Environ()...)
+	env = append(env, "GIT_TERMINAL_PROMPT=0")
+	homeDir = strings.TrimSpace(homeDir)
+	if homeDir != "" {
+		sshKeyPath := filepath.Join(homeDir, ".ssh", "id_ed25519")
+		knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
+		sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
+		env = append(env, "GIT_SSH_COMMAND="+sshCmd)
+	}
+	return env
+}
+
+func defaultGitClonerWithHome(ctx context.Context, homeDir, cloneURL, destDir, branch string) error {
+	cloneURL = ToSSHCloneURL(cloneURL)
+	gitEnv := gitEnvForHome(homeDir)
 	if _, err := os.Stat(filepath.Join(destDir, ".git")); err == nil {
+		if cloneURL != "" {
+			setURLCmd := exec.CommandContext(ctx, "git", "-C", destDir, "remote", "set-url", "origin", cloneURL)
+			setURLCmd.Env = gitEnv
+			_ = setURLCmd.Run()
+		}
 		cmd := exec.CommandContext(ctx, "git", "-C", destDir, "pull", "--ff-only")
+		cmd.Env = gitEnv
 		_ = cmd.Run()
 		return nil
 	}
@@ -1132,6 +1222,7 @@ func defaultGitCloner(ctx context.Context, cloneURL, destDir, branch string) err
 	}
 	args = append(args, cloneURL, destDir)
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = gitEnv
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git clone failed: %w (%s)", err, strings.TrimSpace(string(out)))
