@@ -110,6 +110,15 @@ func NewCodec(secret []byte) (*Codec, error) {
 	return &Codec{secret: keyCopy}, nil
 }
 
+// DeriveSigningSecret derives the deterministic 32-byte HMAC signing key from
+// a shared cluster bearer token ("omc_live_...") using HMAC-SHA256 key derivation.
+func DeriveSigningSecret(clusterToken string) []byte {
+	trimmed := strings.TrimSpace(clusterToken)
+	mac := hmac.New(sha256.New, []byte(KeyDerivationContext))
+	_, _ = mac.Write([]byte(trimmed))
+	return mac.Sum(nil)
+}
+
 // NewCodecFromClusterToken derives a deterministic 32-byte HMAC signing key from
 // the shared cluster bearer token ("omc_live_...") using HMAC-SHA256 key derivation.
 func NewCodecFromClusterToken(clusterToken string) (*Codec, error) {
@@ -117,9 +126,7 @@ func NewCodecFromClusterToken(clusterToken string) (*Codec, error) {
 	if len(trimmed) < MinSecretLength {
 		return nil, fmt.Errorf("%w: cluster token must be at least %d characters", domain.ErrInvalidConfig, MinSecretLength)
 	}
-	mac := hmac.New(sha256.New, []byte(KeyDerivationContext))
-	_, _ = mac.Write([]byte(trimmed))
-	return &Codec{secret: mac.Sum(nil)}, nil
+	return &Codec{secret: DeriveSigningSecret(trimmed)}, nil
 }
 
 // Sign validates static claim invariants and produces a signed "v1.<payload>.<sig>" ticket.

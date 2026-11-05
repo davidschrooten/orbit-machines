@@ -299,13 +299,14 @@ func spawnShellPane(ctx context.Context, homeDir, workDir, id, title string, col
 		"ORBIT_TAB_ID="+id,
 	)
 	pane, err := pty.Spawn(ctx, pty.PaneConfig{
-		ID:      id,
-		Title:   title,
-		Command: cmdArgs,
-		Dir:     dir,
-		Env:     env,
-		Cols:    cols,
-		Rows:    rows,
+		ID:             id,
+		Title:          title,
+		Command:        cmdArgs,
+		Dir:            dir,
+		Env:            env,
+		Cols:           cols,
+		Rows:           rows,
+		RawPassthrough: true,
 	})
 	if err != nil {
 		return pty.NewVirtualPane(id, title, cols, rows)

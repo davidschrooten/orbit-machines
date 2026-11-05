@@ -173,3 +173,69 @@ func TestVirtualPane_DeterministicEmulationAndDirtyTracking(t *testing.T) {
 		t.Fatalf("Scrollback len = %d, want %d", len(vp.Scrollback()), pty.MaxScrollbackBytes)
 	}
 }
+
+func TestPane_RawPassthroughTerminalQueriesAndSIGWINCH(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pane, err := pty.Spawn(ctx, pty.PaneConfig{
+		ID:             "pane-raw-tui",
+		Title:          "Claude/Nvim TUI",
+		Command:        []string{"/bin/sh"},
+		Cols:           120,
+		Rows:           36,
+		RawPassthrough: true,
+	})
+	if err != nil {
+		t.Fatalf("Spawn(/bin/sh, RawPassthrough): %v", err)
+	}
+	defer func() { _ = pane.Close() }()
+
+	if !pane.RawPassthrough() {
+		t.Fatalf("expected RawPassthrough() == true")
+	}
+
+	// Simulate full-screen TUI terminal queries (DSR \x1b[6n, DA1 \x1b[c, DA2 \x1b[>c,
+	// OSC 10/11 color queries, DECRQM, Kitty keyboard query, alt-screen \x1b[?1049h)
+	// that previously blocked charmbracelet/x/vt's unbuffered response pipe.
+	for range 64 {
+		pane.FeedOutput([]byte("\x1b[?1049h\x1b[6n\x1b[c\x1b[>c\x1b]10;?\x07\x1b]11;?\x07\x1b[?2026$p\x1b[?uTUI_FRAME_OK\r\n"))
+	}
+	if !strings.Contains(string(pane.Scrollback()), "TUI_FRAME_OK") {
+		t.Fatalf("expected Scrollback to contain TUI_FRAME_OK")
+	}
+
+	// Install a SIGWINCH trap inside the PTY shell and verify both Resize (even with identical dimensions)
+	// and Redraw/NotifyWinch deliver SIGWINCH to the child process.
+	_, err = pane.WriteInput([]byte("trap 'printf \"WINCH_SIGNAL_OK\\n\"' WINCH; printf \"TRAP_READY\\n\"\n"))
+	if err != nil {
+		t.Fatalf("WriteInput trap: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(string(pane.Scrollback()), "TRAP_READY") {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	if err := pane.Resize(120, 36); err != nil {
+		t.Fatalf("Resize(120, 36): %v", err)
+	}
+	pane.Redraw()
+
+	var gotWinch bool
+	for time.Now().Before(deadline) {
+		if strings.Contains(string(pane.Scrollback()), "WINCH_SIGNAL_OK") {
+			gotWinch = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !gotWinch {
+		t.Fatalf("expected child process to receive SIGWINCH on Resize/Redraw, scrollback:\n%s", string(pane.Scrollback()))
+	}
+}

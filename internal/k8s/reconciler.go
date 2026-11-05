@@ -449,9 +449,11 @@ func NewHTTPPodOrchestrator(cfg HTTPConfig) (*HTTPPodOrchestrator, error) {
 func (o *HTTPPodOrchestrator) EnsurePod(ctx context.Context, req PodRequest) (PodEndpoint, error) {
 	existing, err := o.getPod(ctx, req.MachineID.PodName())
 	if err == nil {
-		return podEndpointFromManifest(existing), nil
-	}
-	if !errors.Is(err, ErrPodNotFound) {
+		if existing.Metadata.DeletionTimestamp == "" && existing.Status.Phase != "Failed" && existing.Status.Phase != "Succeeded" {
+			return podEndpointFromManifest(existing), nil
+		}
+		_ = o.DeletePod(ctx, req.MachineID)
+	} else if !errors.Is(err, ErrPodNotFound) {
 		return PodEndpoint{}, err
 	}
 
@@ -576,7 +578,7 @@ func (o *HTTPPodOrchestrator) WaitPodReady(ctx context.Context, mid domain.Machi
 
 // DeletePod deletes the Machine Pod for mid, ignoring 404 Not Found.
 func (o *HTTPPodOrchestrator) DeletePod(ctx context.Context, mid domain.MachineID) error {
-	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", o.apiServerURL, o.manifestCfg.Namespace, mid.PodName())
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s?gracePeriodSeconds=2", o.apiServerURL, o.manifestCfg.Namespace, mid.PodName())
 	err := o.doJSON(ctx, http.MethodDelete, url, nil, nil)
 	if errors.Is(err, ErrPodNotFound) {
 		return nil

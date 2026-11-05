@@ -465,9 +465,14 @@ func (s *WSServer) handleShellWS(r *http.Request, client *wsClient) {
 	defer cancel()
 
 	// Immediately replay the tab's raw scrollback buffer as a 0x10 FrameSnapshot.
-	initialSnap, _ := s.codec.EncodeSnapshot(ts.pane.Scrollback())
+	scrollback := ts.pane.Scrollback()
+	initialSnap, _ := s.codec.EncodeSnapshot(scrollback)
 	if err := client.WriteBinary(ctx, initialSnap); err != nil {
 		return
+	}
+	if len(scrollback) > 0 {
+		cols, rows := ts.pane.Size()
+		_ = ts.pane.Resize(cols, rows)
 	}
 
 	// Start periodic 20s FramePong keepalive so intermediate proxies/ingresses do not drop idle shells.
