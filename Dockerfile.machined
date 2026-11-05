@@ -12,12 +12,16 @@ RUN mkdir -p /etc/nix \
       /usr/local/bin \
       /usr/bin \
       /bin \
+      /var/empty \
       /home/orbit/.config/orbit \
       /home/orbit/workspace \
       /nix/var/nix/profiles/per-user/orbit \
       /nix/var/nix/gcroots/per-user/orbit \
       /nix/var/nix/temproots && \
     printf "experimental-features = nix-command flakes\nbuild-users-group =\nsandbox = false\nfilter-syscalls = false\n" > /etc/nix/nix.conf && \
+    if [ -L /nix/var/nix/profiles/per-user/root/channels ]; then \
+      ln -sf channels-1-link /nix/var/nix/profiles/per-user/root/channels; \
+    fi && \
     nix-env -i -f /etc/orbit/configuration.nix && \
     export PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH" && \
     ln -sf "$(readlink -f /root/.nix-profile)" /nix/var/nix/profiles/orbit && \
@@ -36,7 +40,8 @@ RUN mkdir -p /etc/nix \
     grep -q '^orbit:' /etc/group || echo 'orbit:x:1000:' >> /etc/group && \
     grep -q '^orbit:' /etc/passwd || echo 'orbit:x:1000:1000:Orbit Machine User:/home/orbit:/bin/bash' >> /etc/passwd && \
     chmod 755 /root && \
-    chown -R 1000:1000 /home/orbit /nix /etc/nix
+    chown -R 1000:1000 /nix /home/orbit /etc/nix /var/empty && \
+    chmod -R u+w /nix /home/orbit /etc/nix /var/empty
 
 COPY --from=builder /out/orbit-machined /usr/local/bin/orbit-machined
 COPY --from=builder /out/orbit-helper /usr/local/bin/orbit-helper
