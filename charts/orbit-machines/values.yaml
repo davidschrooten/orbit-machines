@@ -24,9 +24,10 @@ dispatcher:
     enabled: true
     className: ""
     host: "machines.orbit.example.com"
-    annotations: {}
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
     tls:
-      enabled: false
+      enabled: true
       secretName: "orbit-machines-tls"
   resources:
     requests:
@@ -85,12 +86,12 @@ s3:
   minio:
     enabled: true
     image:
-      repository: quay.io/minio/minio
-      tag: "RELEASE.2025-02-18T16-25-55Z"
+      repository: minio/minio
+      tag: "latest"
       pullPolicy: IfNotPresent
     mcImage:
-      repository: quay.io/minio/mc
-      tag: "RELEASE.2025-02-15T10-36-16Z"
+      repository: minio/mc
+      tag: "latest"
       pullPolicy: IfNotPresent
     persistence:
       size: "50Gi"
