@@ -3,6 +3,9 @@ package dispatcher_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -420,5 +423,171 @@ func TestServer_WebSocketEdgeCases(t *testing.T) {
 	defer func() { _ = conn2.CloseNow() }()
 	if _, _, err := conn2.Read(ctx); err == nil {
 		t.Fatalf("expected connection 2 to close when cluster capacity is reached")
+	}
+}
+
+func TestServer_MultiTabConcurrencyAndShutdownVariants(t *testing.T) {
+	t.Parallel()
+
+	frameCodec, err := protocol.NewFrameCodec()
+	if err != nil {
+		t.Fatalf("NewFrameCodec: %v", err)
+	}
+	podSrv := newTestPodWSServer(t, frameCodec)
+	defer podSrv.Close()
+
+	podWSURL := "ws" + strings.TrimPrefix(podSrv.URL, "http") + "/ws"
+	fakeK8s := k8s.NewFakePodOrchestrator(10)
+	fakeK8s.SetDefaultWebSocketURL(podWSURL)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	ticketCodec, err := ticket.NewCodecFromClusterToken(testClusterToken)
+	if err != nil {
+		t.Fatalf("NewCodecFromClusterToken: %v", err)
+	}
+
+	srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
+		ClusterToken:      testClusterToken,
+		MaxConcurrentPods: 10,
+		TicketCodec:       ticketCodec,
+		FrameCodec:        frameCodec,
+		Orchestrator:      fakeK8s,
+		Now:               func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	gwSrv := httptest.NewServer(srv.Handler())
+	defer gwSrv.Close()
+
+	signedTicket, err := ticketCodec.Sign(ticket.Claims{
+		JTI:           "jti_multitab",
+		Issuer:        ticket.ExpectedIssuer,
+		Subject:       "usr_multitab",
+		WorkspaceID:   "ws_multitab",
+		WorkspaceSlug: "acme",
+		UserLogin:     "alice",
+		Tier:          domain.TierStandard,
+		IssuedAt:      now.Unix(),
+		ExpiresAt:     now.Add(60 * time.Second).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("Sign ticket: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dialAndDrainToSnapshot := func(tab string) *websocket.Conn {
+		t.Helper()
+		wsURL := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + signedTicket + "&tab=" + tab
+		conn, _, dialErr := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose
+		if dialErr != nil {
+			t.Fatalf("Dial %s: %v", tab, dialErr)
+		}
+		for {
+			_, raw, rErr := conn.Read(ctx)
+			if rErr != nil {
+				t.Fatalf("Read initial frames on %s: %v", tab, rErr)
+			}
+			if dec, dErr := frameCodec.Decode(raw); dErr == nil && dec.Type == protocol.FrameSnapshot {
+				return conn
+			}
+		}
+	}
+
+	// 1. Open Tab 1 and Tab 2 concurrently for the same MachineID.
+	// Verify Tab 2 connecting does NOT cancel Tab 1!
+	tab1Conn := dialAndDrainToSnapshot("tab-1")
+	defer func() { _ = tab1Conn.CloseNow() }()
+
+	tab2Conn := dialAndDrainToSnapshot("tab-2")
+	defer func() { _ = tab2Conn.CloseNow() }()
+
+	for name, conn := range map[string]*websocket.Conn{"tab-1": tab1Conn, "tab-2": tab2Conn} {
+		inFrame, _ := frameCodec.EncodeInput([]byte("hello-" + name + "\n"))
+		if err := conn.Write(ctx, websocket.MessageBinary, inFrame); err != nil {
+			t.Fatalf("Write on %s while other tab open: %v", name, err)
+		}
+		_, rawDiff, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read diff on %s while other tab open: %v", name, err)
+		}
+		dec, err := frameCodec.Decode(rawDiff)
+		if err != nil || dec.Type != protocol.FrameDiff || string(dec.Data) != "echo: hello-"+name+"\n" {
+			t.Fatalf("unexpected diff on %s: %+v, err=%v", name, dec, err)
+		}
+	}
+
+	// 2. Closing Tab 2 with close status 4001 ("shutdown-machine") triggers Pod deletion and closes Tab 1.
+	_ = tab2Conn.Close(4001, "shutdown-machine")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		active, _ := fakeK8s.ListActivePods(ctx)
+		if len(active) == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if active, _ := fakeK8s.ListActivePods(ctx); len(active) != 0 {
+		t.Fatalf("expected 0 active pods after 4001 shutdown-machine close, got %d", len(active))
+	}
+
+	// 3. Test authorizeBearer variants on DELETE /api/v1/sessions/{ws_id}/{sub}:
+	//    - derived signing_secret (base64url)
+	//    - token_digest (sha256 hex)
+	//    - valid signed ticket
+	mid, _ := domain.NewMachineID("ws_multitab", "usr_multitab")
+	signingSecretB64 := base64.RawURLEncoding.EncodeToString(ticket.DeriveSigningSecret(testClusterToken))
+	sum := sha256.Sum256([]byte(testClusterToken))
+	tokenDigestHex := hex.EncodeToString(sum[:])
+
+	for _, bearer := range []string{signingSecretB64, tokenDigestHex, signedTicket} {
+		_, _ = fakeK8s.EnsurePod(ctx, k8s.PodRequest{MachineID: mid, Tier: domain.TierStandard})
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, gwSrv.URL+"/api/v1/sessions/ws_multitab/usr_multitab", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("DELETE session with bearer %q: %v", bearer[:8], doErr)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("DELETE session with bearer %q status = %d, want 200", bearer[:8], resp.StatusCode)
+		}
+		if active, _ := fakeK8s.ListActivePods(ctx); len(active) != 0 {
+			t.Fatalf("expected pod deleted with bearer %q", bearer[:8])
+		}
+	}
+
+	// 4. Test direct ticket-authenticated shutdown on DELETE /ws/terminal?ticket=... and POST /ws/terminal?action=shutdown.
+	for _, method := range []string{http.MethodDelete, http.MethodPost, http.MethodGet} {
+		_, _ = fakeK8s.EnsurePod(ctx, k8s.PodRequest{MachineID: mid, Tier: domain.TierStandard})
+		reqURL := gwSrv.URL + "/ws/terminal?ticket=" + signedTicket + "&action=shutdown"
+		req, _ := http.NewRequestWithContext(ctx, method, reqURL, nil)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("%s /ws/terminal shutdown: %v", method, doErr)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s /ws/terminal shutdown status = %d, want 200", method, resp.StatusCode)
+		}
+		if active, _ := fakeK8s.ListActivePods(ctx); len(active) != 0 {
+			t.Fatalf("expected pod deleted after %s /ws/terminal shutdown", method)
+		}
+	}
+
+	// Invalid ticket on DELETE /ws/terminal returns 401.
+	badShutReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, gwSrv.URL+"/ws/terminal", nil)
+	badShutReq.Header.Set("Authorization", "Bearer invalid-ticket")
+	badShutResp, err := http.DefaultClient.Do(badShutReq)
+	if err != nil {
+		t.Fatalf("DELETE /ws/terminal invalid ticket: %v", err)
+	}
+	_ = badShutResp.Body.Close()
+	if badShutResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for invalid ticket on DELETE /ws/terminal, got %d", badShutResp.StatusCode)
 	}
 }

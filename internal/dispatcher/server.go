@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -49,8 +50,10 @@ type Server struct {
 	orbitClient       orbitclient.ControlPlaneClient
 	now               func() time.Time
 
-	mu       sync.Mutex
-	sessions map[string]context.CancelFunc
+	mu            sync.Mutex
+	nextSessionID uint64
+	sessions      map[string]map[uint64]context.CancelFunc
+	endpoints     map[string]k8s.PodEndpoint
 }
 
 // NewServer validates cfg and constructs a Server.
@@ -78,7 +81,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		orchestrator:      cfg.Orchestrator,
 		orbitClient:       cfg.OrbitClient,
 		now:               nowFn,
-		sessions:          make(map[string]context.CancelFunc),
+		sessions:          make(map[string]map[uint64]context.CancelFunc),
+		endpoints:         make(map[string]k8s.PodEndpoint),
 	}, nil
 }
 
@@ -88,6 +92,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleHealthz)
 	mux.HandleFunc("GET /ws/terminal", s.handleTerminalWS)
+	mux.HandleFunc("DELETE /ws/terminal", s.handleTerminalShutdown)
+	mux.HandleFunc("POST /ws/terminal", s.handleTerminalShutdown)
 	mux.HandleFunc("DELETE /api/v1/sessions/{ws_id}/{sub}", s.handleDeleteSession)
 	return mux
 }
@@ -162,6 +168,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("action")), "shutdown") {
+		s.handleTerminalShutdown(w, r)
+		return
+	}
+
 	rawTicket := strings.TrimSpace(r.URL.Query().Get("ticket"))
 	claims, err := s.ticketCodec.Verify(rawTicket, s.now())
 	if err != nil {
@@ -182,8 +193,8 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 
 	sessCtx, sessCancel := context.WithCancel(r.Context())
 	defer sessCancel()
-	s.registerActiveSession(mid, sessCancel)
-	defer s.unregisterActiveSession(mid)
+	connID := s.registerActiveSession(mid, sessCancel)
+	defer s.unregisterActiveSession(mid, connID)
 
 	var (
 		mcpToken  string
@@ -242,6 +253,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.setPodEndpoint(mid, ep)
 	s.pushPodContext(sessCtx, ep, mid, claims, mcpToken, repos)
 
 	podWSURL := appendTabQuery(ep.WebSocketURL, r.URL.Query().Get("tab"))
@@ -253,7 +265,9 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	podConn.SetReadLimit(64 << 20)
 	defer func() { _ = podConn.CloseNow() }()
 
-	_ = spliceWebSockets(sessCtx, clientConn, podConn)
+	if spliceErr := spliceWebSockets(sessCtx, clientConn, podConn); isShutdownClose(spliceErr) {
+		_ = s.shutdownPod(mid)
+	}
 }
 
 func appendTabQuery(wsURL, tab string) string {
@@ -269,7 +283,7 @@ func appendTabQuery(wsURL, tab string) string {
 }
 
 func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid domain.MachineID, claims ticket.Claims, mcpToken string, repos []protocol.RepoCredential) {
-	targetURL := podContextURL(ep)
+	targetURL := podEndpointURL(ep, "/api/v1/context")
 	if targetURL == "" || (mcpToken == "" && len(repos) == 0 && s.orbitURL == "") {
 		return
 	}
@@ -294,7 +308,29 @@ func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid dom
 	}
 }
 
-func podContextURL(ep k8s.PodEndpoint) string {
+func (s *Server) snapshotPodBestEffort(mid domain.MachineID) {
+	s.mu.Lock()
+	ep, ok := s.endpoints[mid.PodName()]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	targetURL := podEndpointURL(ep, "/api/v1/snapshot")
+	if targetURL == "" {
+		return
+	}
+	snapCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(snapCtx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		return
+	}
+	if resp, doErr := http.DefaultClient.Do(req); doErr == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func podEndpointURL(ep k8s.PodEndpoint, path string) string {
 	u, err := url.Parse(strings.TrimSpace(ep.WebSocketURL))
 	if err != nil || u.Host == "" {
 		return ""
@@ -303,7 +339,7 @@ func podContextURL(ep k8s.PodEndpoint) string {
 	if u.Scheme == "wss" || u.Scheme == "https" {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://%s/api/v1/context", scheme, u.Host)
+	return fmt.Sprintf("%s://%s%s", scheme, u.Host, path)
 }
 
 func (s *Server) deriveProfileKeyHex(mid domain.MachineID) string {
@@ -329,6 +365,43 @@ func dialPodWebSocket(ctx context.Context, wsURL string) (*websocket.Conn, error
 	return nil, lastErr
 }
 
+func (s *Server) shutdownPod(mid domain.MachineID) error {
+	s.snapshotPodBestEffort(mid)
+	s.cancelActiveSession(mid)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return s.orchestrator.DeletePod(ctx, mid)
+}
+
+func (s *Server) handleTerminalShutdown(w http.ResponseWriter, r *http.Request) {
+	rawTicket := strings.TrimSpace(r.URL.Query().Get("ticket"))
+	if rawTicket == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(auth, "Bearer ") {
+			rawTicket = strings.TrimSpace(auth[len("Bearer "):])
+		}
+	}
+	claims, err := s.ticketCodec.Verify(rawTicket, s.now())
+	if err != nil {
+		http.Error(w, "invalid or expired session ticket", http.StatusUnauthorized)
+		return
+	}
+	mid, _ := claims.MachineID()
+
+	if err := s.shutdownPod(mid); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":   "terminated",
+		"pod":      mid.PodName(),
+		"pod_name": mid.PodName(),
+	})
+}
+
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeBearer(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -341,8 +414,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.cancelActiveSession(mid)
-	if err := s.orchestrator.DeletePod(r.Context(), mid); err != nil {
+	if err := s.shutdownPod(mid); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -351,6 +423,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":   "terminated",
+		"pod":      mid.PodName(),
 		"pod_name": mid.PodName(),
 	})
 }
@@ -362,44 +435,112 @@ func (s *Server) authorizeBearer(r *http.Request) bool {
 		return false
 	}
 	got := strings.TrimSpace(auth[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.clusterToken)) == 1
+	if got == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.clusterToken)) == 1 {
+		return true
+	}
+	signingSecret := ticket.DeriveSigningSecret(s.clusterToken)
+	derivedRawURL := base64.RawURLEncoding.EncodeToString(signingSecret)
+	if subtle.ConstantTimeCompare([]byte(got), []byte(derivedRawURL)) == 1 {
+		return true
+	}
+	derivedURL := base64.URLEncoding.EncodeToString(signingSecret)
+	if subtle.ConstantTimeCompare([]byte(got), []byte(derivedURL)) == 1 {
+		return true
+	}
+	sum := sha256.Sum256([]byte(s.clusterToken))
+	tokenDigest := hex.EncodeToString(sum[:])
+	if subtle.ConstantTimeCompare([]byte(got), []byte(tokenDigest)) == 1 {
+		return true
+	}
+	if _, err := s.ticketCodec.Verify(got, s.now()); err == nil {
+		return true
+	}
+	return false
 }
 
-func (s *Server) registerActiveSession(mid domain.MachineID, cancel context.CancelFunc) {
+func (s *Server) setPodEndpoint(mid domain.MachineID, ep k8s.PodEndpoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endpoints[mid.PodName()] = ep
+}
+
+func (s *Server) registerActiveSession(mid domain.MachineID, cancel context.CancelFunc) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextSessionID++
+	connID := s.nextSessionID
+	key := mid.PodName()
+	if s.sessions[key] == nil {
+		s.sessions[key] = make(map[uint64]context.CancelFunc)
+	}
+	s.sessions[key][connID] = cancel
+	return connID
+}
+
+func (s *Server) unregisterActiveSession(mid domain.MachineID, connID uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := mid.PodName()
-	if prev, ok := s.sessions[key]; ok {
-		prev()
+	conns, ok := s.sessions[key]
+	if !ok {
+		return
 	}
-	s.sessions[key] = cancel
-}
-
-func (s *Server) unregisterActiveSession(mid domain.MachineID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.sessions, mid.PodName())
+	delete(conns, connID)
+	if len(conns) == 0 {
+		delete(s.sessions, key)
+	}
 }
 
 func (s *Server) cancelActiveSession(mid domain.MachineID) {
 	s.mu.Lock()
-	cancel, ok := s.sessions[mid.PodName()]
-	delete(s.sessions, mid.PodName())
+	key := mid.PodName()
+	conns, ok := s.sessions[key]
+	delete(s.sessions, key)
+	delete(s.endpoints, key)
 	s.mu.Unlock()
-	if ok {
+	if !ok {
+		return
+	}
+	for _, cancel := range conns {
 		cancel()
 	}
 }
 
 func spliceWebSockets(ctx context.Context, a, b *websocket.Conn) error {
+	var (
+		errMu      sync.Mutex
+		shutdownBy error
+	)
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return pumpWebSocket(gCtx, a, b)
+		err := pumpWebSocket(gCtx, a, b)
+		if isShutdownClose(err) {
+			errMu.Lock()
+			shutdownBy = err
+			errMu.Unlock()
+		}
+		return err
 	})
 	g.Go(func() error {
 		return pumpWebSocket(gCtx, b, a)
 	})
-	return g.Wait()
+	waitErr := g.Wait()
+	errMu.Lock()
+	defer errMu.Unlock()
+	if shutdownBy != nil {
+		return shutdownBy
+	}
+	return waitErr
+}
+
+func isShutdownClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	return websocket.CloseStatus(err) == 4001 || strings.Contains(err.Error(), "shutdown-machine")
 }
 
 func pumpWebSocket(ctx context.Context, src, dst *websocket.Conn) error {
@@ -408,6 +549,8 @@ func pumpWebSocket(ctx context.Context, src, dst *websocket.Conn) error {
 		if err != nil {
 			if websocket.CloseStatus(err) == 4000 || strings.Contains(err.Error(), "close-tab") {
 				_ = dst.Close(4000, "close-tab")
+			} else if isShutdownClose(err) {
+				_ = dst.Close(4001, "shutdown-machine")
 			}
 			return err
 		}

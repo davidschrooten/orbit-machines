@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
@@ -23,20 +24,22 @@ const MaxScrollbackBytes = 64 * 1024
 
 // PaneConfig configures a child PTY process and its virtual terminal buffer.
 type PaneConfig struct {
-	ID       string
-	Title    string
-	Command  []string
-	Dir      string
-	Env      []string
-	Cols     int
-	Rows     int
-	OnOutput func(chunk []byte)
+	ID             string
+	Title          string
+	Command        []string
+	Dir            string
+	Env            []string
+	Cols           int
+	Rows           int
+	RawPassthrough bool
+	OnOutput       func(chunk []byte)
 }
 
 // Pane couples a child PTY (or headless virtual buffer) with a VT emulator.
 type Pane struct {
-	id    string
-	title string
+	id             string
+	title          string
+	rawPassthrough bool
 
 	mu         sync.Mutex
 	emulator   *vt.Emulator
@@ -54,7 +57,7 @@ type Pane struct {
 }
 
 // Spawn starts cfg.Command attached to a real pseudo-terminal and streams its
-// stdout/stderr into an in-memory VT emulator.
+// stdout/stderr into an in-memory VT emulator (or directly to OnOutput when RawPassthrough is set).
 func Spawn(ctx context.Context, cfg PaneConfig) (*Pane, error) {
 	if strings.TrimSpace(cfg.ID) == "" {
 		return nil, fmt.Errorf("%w: pane ID is required", domain.ErrInvalidConfig)
@@ -86,14 +89,15 @@ func Spawn(ctx context.Context, cfg PaneConfig) (*Pane, error) {
 
 	em := vt.NewEmulator(cols, rows)
 	p := &Pane{
-		id:       cfg.ID,
-		title:    title,
-		emulator: em,
-		cols:     cols,
-		rows:     rows,
-		ptmx:     ptmx,
-		cmd:      cmd,
-		onOutput: cfg.OnOutput,
+		id:             cfg.ID,
+		title:          title,
+		rawPassthrough: cfg.RawPassthrough,
+		emulator:       em,
+		cols:           cols,
+		rows:           rows,
+		ptmx:           ptmx,
+		cmd:            cmd,
+		onOutput:       cfg.OnOutput,
 	}
 	p.dirty.Store(true)
 
@@ -122,6 +126,9 @@ func (p *Pane) ID() string { return p.id }
 
 // Title returns the pane's human-readable title.
 func (p *Pane) Title() string { return p.title }
+
+// RawPassthrough reports whether the pane bypasses in-memory VT emulation on output chunks.
+func (p *Pane) RawPassthrough() bool { return p.rawPassthrough }
 
 // Size returns the current terminal width (cols) and height (rows).
 func (p *Pane) Size() (int, int) {
@@ -152,8 +159,8 @@ func (p *Pane) RecordedInput() []byte {
 	return out
 }
 
-// FeedOutput writes raw ANSI output directly into the VT emulator, appends to
-// scrollback, marks the pane dirty, and notifies any registered output listener.
+// FeedOutput writes raw ANSI output directly into the VT emulator (when RawPassthrough is false),
+// appends to scrollback, marks the pane dirty, and notifies any registered output listener.
 func (p *Pane) FeedOutput(data []byte) {
 	if len(data) == 0 {
 		return
@@ -162,7 +169,9 @@ func (p *Pane) FeedOutput(data []byte) {
 	copy(chunk, data)
 
 	p.mu.Lock()
-	_, _ = p.emulator.Write(chunk)
+	if !p.rawPassthrough && p.emulator != nil {
+		_, _ = p.emulator.Write(chunk)
+	}
 	p.appendScrollbackLocked(chunk)
 	cb := p.onOutput
 	p.mu.Unlock()
@@ -199,7 +208,8 @@ func (p *Pane) appendScrollbackLocked(chunk []byte) {
 	}
 }
 
-// Resize updates both the VT emulator dimensions and the OS PTY window size (TIOCSWINSZ).
+// Resize updates both the VT emulator dimensions and the OS PTY window size (TIOCSWINSZ),
+// and signals SIGWINCH to the child process group so full-screen TUI apps redraw.
 func (p *Pane) Resize(cols, rows int) error {
 	if cols <= 0 || rows <= 0 {
 		return fmt.Errorf("%w: pane dimensions must be positive (%dx%d)", domain.ErrInvalidConfig, cols, rows)
@@ -207,8 +217,11 @@ func (p *Pane) Resize(cols, rows int) error {
 	p.mu.Lock()
 	p.cols = cols
 	p.rows = rows
-	p.emulator.Resize(cols, rows)
+	if !p.rawPassthrough && p.emulator != nil {
+		p.emulator.Resize(cols, rows)
+	}
 	ptmx := p.ptmx
+	cmd := p.cmd
 	p.mu.Unlock()
 
 	p.dirty.Store(true)
@@ -219,7 +232,36 @@ func (p *Pane) Resize(cols, rows int) error {
 			Rows: uint16(rows),
 		})
 	}
+	if cmd != nil && cmd.Process != nil && !p.exited.Load() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGWINCH)
+		_ = cmd.Process.Signal(syscall.SIGWINCH)
+	}
 	return nil
+}
+
+// NotifyWinch re-applies the current PTY window size and sends SIGWINCH to the child process group.
+func (p *Pane) NotifyWinch() {
+	p.mu.Lock()
+	cols, rows := p.cols, p.rows
+	ptmx := p.ptmx
+	cmd := p.cmd
+	p.mu.Unlock()
+
+	if ptmx != nil {
+		_ = pty.Setsize(ptmx, &pty.Winsize{
+			Cols: uint16(cols),
+			Rows: uint16(rows),
+		})
+	}
+	if cmd != nil && cmd.Process != nil && !p.exited.Load() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGWINCH)
+		_ = cmd.Process.Signal(syscall.SIGWINCH)
+	}
+}
+
+// Redraw triggers a terminal size refresh and SIGWINCH signal for full-screen TUI applications.
+func (p *Pane) Redraw() {
+	p.NotifyWinch()
 }
 
 // ConsumeDirty atomically clears and returns whether the pane has new state to render.
