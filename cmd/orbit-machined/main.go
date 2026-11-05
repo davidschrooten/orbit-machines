@@ -4,16 +4,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
 	"github.com/davidschrooten/orbit-machines/internal/domain"
+	"github.com/davidschrooten/orbit-machines/internal/pty"
+	"github.com/davidschrooten/orbit-machines/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -114,13 +120,82 @@ func collectStorePaths(args []string, envOutPaths string) []string {
 func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedConfig) error {
 	return func(ctx context.Context, cfg config.MachinedConfig) error {
 		logger := slog.New(slog.NewJSONHandler(logOut, nil))
-		logger.InfoContext(ctx, "orbit-machined configured",
+		comp := tui.NewCompositor(tui.CompositorConfig{
+			WorkspaceSlug: cfg.MachineID.WorkspaceID(),
+			ResourceTier:  string(cfg.ResourceTier),
+			SpawnPane: func(id, title string, cols, rows int) *pty.Pane {
+				return spawnShellPane(ctx, cfg.WorkDir, id, title, cols, rows)
+			},
+		})
+		defer func() { _ = comp.Close() }()
+
+		wsSrv, err := tui.NewWSServer(tui.WSServerConfig{Compositor: comp})
+		if err != nil {
+			return err
+		}
+
+		ln, err := net.Listen("tcp", cfg.ListenAddr)
+		if err != nil {
+			return err
+		}
+		httpSrv := &http.Server{
+			Handler:           wsSrv.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+
+		logger.InfoContext(ctx, "orbit-machined listening",
 			slog.String("pod", cfg.MachineID.PodName()),
 			slog.String("tier", string(cfg.ResourceTier)),
-			slog.String("listen_addr", cfg.ListenAddr),
+			slog.String("listen_addr", ln.Addr().String()),
 		)
-		return nil
+
+		errCh := make(chan error, 1)
+		go func() {
+			if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				errCh <- serveErr
+				return
+			}
+			errCh <- nil
+		}()
+
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutCtx)
+			return <-errCh
+		case serveErr := <-errCh:
+			return serveErr
+		}
 	}
+}
+
+func spawnShellPane(ctx context.Context, workDir, id, title string, cols, rows int) *pty.Pane {
+	shell := strings.TrimSpace(os.Getenv("SHELL"))
+	if shell == "" {
+		if _, err := os.Stat("/bin/bash"); err == nil {
+			shell = "/bin/bash"
+		} else {
+			shell = "/bin/sh"
+		}
+	}
+	dir := workDir
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		dir = os.TempDir()
+	}
+	pane, err := pty.Spawn(ctx, pty.PaneConfig{
+		ID:      id,
+		Title:   title,
+		Command: []string{shell},
+		Dir:     dir,
+		Env:     append(os.Environ(), "TERM=xterm-256color"),
+		Cols:    cols,
+		Rows:    rows,
+	})
+	if err != nil {
+		return pty.NewVirtualPane(id, title, cols, rows)
+	}
+	return pane
 }
 
 func defaultHookUploadRunner(logOut io.Writer) func(context.Context, []string) error {

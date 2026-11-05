@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -95,7 +98,10 @@ func defaultServeRunner(logOut io.Writer) ServeRunner {
 		ticketCodec, _ := ticket.NewCodecFromClusterToken(cfg.ClusterToken)
 		frameCodec, _ := protocol.NewFrameCodec()
 		orbitClient, _ := orbitclient.NewClient(cfg.OrbitURL, cfg.ClusterToken)
-		orchestrator := k8s.NewFakePodOrchestrator(cfg.MaxConcurrentPods)
+		orchestrator := buildOrchestrator(cfg, os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT"),
+			"/var/run/secrets/kubernetes.io/serviceaccount/token",
+			"/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+		)
 
 		srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
 			ClusterToken:      cfg.ClusterToken,
@@ -157,4 +163,46 @@ func defaultServeRunner(logOut io.Writer) ServeRunner {
 			return serveErr
 		}
 	}
+}
+
+func buildOrchestrator(cfg config.DispatcherConfig, k8sHost, k8sPort, tokenPath, caPath string) k8s.PodOrchestrator {
+	host := strings.TrimSpace(k8sHost)
+	if host == "" {
+		return k8s.NewFakePodOrchestrator(cfg.MaxConcurrentPods)
+	}
+	port := strings.TrimSpace(k8sPort)
+	if port == "" {
+		port = "443"
+	}
+	tokenBytes, _ := os.ReadFile(tokenPath)
+	caBytes, _ := os.ReadFile(caPath)
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if len(caBytes) > 0 {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM(caBytes) {
+			tlsCfg.RootCAs = pool
+		}
+	}
+
+	orch, err := k8s.NewHTTPPodOrchestrator(k8s.HTTPConfig{
+		APIServerURL: "https://" + net.JoinHostPort(host, port),
+		BearerToken:  strings.TrimSpace(string(tokenBytes)),
+		Manifest: k8s.ManifestConfig{
+			Namespace:        cfg.KubernetesNamespace,
+			MachineImage:     cfg.MachineImage,
+			S3Endpoint:       cfg.S3Endpoint,
+			S3ProfileBucket:  cfg.S3ProfileBucket,
+			S3NixCacheBucket: cfg.S3NixCacheBucket,
+		},
+		MaxConcurrentPods: cfg.MaxConcurrentPods,
+		HTTPClient: &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		},
+	})
+	if err != nil {
+		return k8s.NewFakePodOrchestrator(cfg.MaxConcurrentPods)
+	}
+	return orch
 }

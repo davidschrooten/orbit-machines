@@ -144,6 +144,7 @@ type EmptyDirVolume struct {
 type Container struct {
 	Name            string                   `json:"name"`
 	Image           string                   `json:"image"`
+	ImagePullPolicy string                   `json:"imagePullPolicy,omitempty"`
 	Args            []string                 `json:"args,omitempty"`
 	Ports           []ContainerPort          `json:"ports,omitempty"`
 	Env             []EnvVar                 `json:"env,omitempty"`
@@ -273,9 +274,10 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 			},
 			Containers: []Container{
 				{
-					Name:  "machined",
-					Image: cfg.MachineImage,
-					Args:  []string{"serve"},
+					Name:            "machined",
+					Image:           cfg.MachineImage,
+					ImagePullPolicy: "IfNotPresent",
+					Args:            []string{"serve"},
 					Ports: []ContainerPort{
 						{Name: "ws", ContainerPort: 8080, Protocol: "TCP"},
 					},
