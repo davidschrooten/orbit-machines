@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/domain"
@@ -46,6 +47,23 @@ type DirenvAllower func(ctx context.Context, dir string) error
 
 // NixEnvRunner installs the declarative Nix package environment from configNixPath.
 type NixEnvRunner func(ctx context.Context, configNixPath string) error
+
+// ToolInstaller installs a CLI tool binary into homeDir (e.g. ~/.local/bin) when missing.
+type ToolInstaller func(ctx context.Context, homeDir, tool string, out io.Writer) error
+
+// NoopToolInstaller is a ToolInstaller that performs no binary installation (used when only syncing config files).
+func NoopToolInstaller(_ context.Context, _, _ string, _ io.Writer) error { return nil }
+
+// NixPackageResult describes a package found in Nixpkgs.
+type NixPackageResult struct {
+	Attribute   string `json:"attribute"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description"`
+}
+
+// NixSearcher searches Nixpkgs for packages matching query.
+type NixSearcher func(ctx context.Context, query string) ([]NixPackageResult, error)
 
 // OrbitContext holds workspace, user, MCP, and repository metadata synced from Orbit.
 type OrbitContext struct {
@@ -141,6 +159,8 @@ type Config struct {
 	GitCloner     GitCloner
 	DirenvAllower DirenvAllower
 	NixEnvRunner  NixEnvRunner
+	ToolInstaller ToolInstaller
+	NixSearcher   NixSearcher
 	HTTPClient    *http.Client
 }
 
@@ -153,6 +173,8 @@ type Manager struct {
 	gitCloner     GitCloner
 	direnvAllower DirenvAllower
 	nixEnvRunner  NixEnvRunner
+	toolInstaller ToolInstaller
+	nixSearcher   NixSearcher
 	httpClient    *http.Client
 }
 
@@ -187,6 +209,18 @@ func NewManager(cfg Config) (*Manager, error) {
 			return defaultNixEnvRunner(ctx, homeDir, configNixPath)
 		}
 	}
+	installer := cfg.ToolInstaller
+	if installer == nil {
+		installer = func(ctx context.Context, hDir, tool string, out io.Writer) error {
+			return defaultToolInstaller(ctx, hDir, tool, out)
+		}
+	}
+	searcher := cfg.NixSearcher
+	if searcher == nil {
+		searcher = func(ctx context.Context, query string) ([]NixPackageResult, error) {
+			return defaultNixSearcher(ctx, homeDir, query)
+		}
+	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -200,6 +234,8 @@ func NewManager(cfg Config) (*Manager, error) {
 		gitCloner:     cloner,
 		direnvAllower: allower,
 		nixEnvRunner:  nixRunner,
+		toolInstaller: installer,
+		nixSearcher:   searcher,
 		httpClient:    httpClient,
 	}
 	_ = m.EnsureGitAndSSH()
@@ -433,10 +469,47 @@ func (m *Manager) syncConfigurationNix() {
 	_ = writeConfigFile(wsCfgPath, []byte(shellinit.DefaultConfigurationNix), 0o644)
 }
 
+// ListConfigurationNixPackages parses ~/.config/orbit/configuration.nix and returns the list
+// of package attributes inside `paths = with pkgs; [ ... ];`.
+func (m *Manager) ListConfigurationNixPackages() ([]string, error) {
+	m.syncConfigurationNix()
+	homeCfgPath := m.ConfigurationNixPath()
+	data, err := os.ReadFile(homeCfgPath)
+	if err != nil {
+		data = []byte(shellinit.DefaultConfigurationNix)
+	}
+	return parseConfigurationNixPackages(string(data))
+}
+
+func parseConfigurationNixPackages(content string) ([]string, error) {
+	endIdx := strings.LastIndex(content, "];")
+	if endIdx < 0 {
+		return nil, fmt.Errorf("%w: invalid configuration.nix format (missing '];')", domain.ErrInvalidConfig)
+	}
+	startIdx := strings.LastIndex(content[:endIdx], "[")
+	if startIdx < 0 {
+		return nil, fmt.Errorf("%w: invalid configuration.nix format (missing '[')", domain.ErrInvalidConfig)
+	}
+	body := content[startIdx+1 : endIdx]
+	var pkgs []string
+	for _, line := range strings.Split(body, "\n") {
+		if commentIdx := strings.Index(line, "#"); commentIdx >= 0 {
+			line = line[:commentIdx]
+		}
+		for _, tok := range strings.Fields(line) {
+			tok = strings.TrimPrefix(strings.TrimSpace(tok), "pkgs.")
+			if tok != "" {
+				pkgs = appendUnique(pkgs, tok)
+			}
+		}
+	}
+	return pkgs, nil
+}
+
 // AddConfigurationNixPackages adds the given Nixpkgs package attribute names to ~/.config/orbit/configuration.nix
 // (if not already present) and mirrors the updated file into <workDir>/.orbit/configuration.nix.
 func (m *Manager) AddConfigurationNixPackages(packages []string) error {
-	pkgs := cleanSlice(packages)
+	pkgs := cleanPackageSlice(packages)
 	if len(pkgs) == 0 {
 		return nil
 	}
@@ -447,13 +520,21 @@ func (m *Manager) AddConfigurationNixPackages(packages []string) error {
 		data = []byte(shellinit.DefaultConfigurationNix)
 	}
 	content := string(data)
-	idx := strings.LastIndex(content, "];")
-	if idx < 0 {
-		return fmt.Errorf("%w: invalid configuration.nix format (missing '];')", domain.ErrInvalidConfig)
+	existing, parseErr := parseConfigurationNixPackages(content)
+	if parseErr != nil {
+		return parseErr
 	}
+	existingSet := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		existingSet[e] = true
+	}
+	idx := strings.LastIndex(content, "];")
 	var addLines strings.Builder
 	for _, pkg := range pkgs {
-		if !strings.Contains(content, " "+pkg+"\n") && !strings.Contains(content, "\t"+pkg+"\n") {
+		pkg = strings.TrimPrefix(pkg, "pkgs.")
+		pkg = strings.TrimPrefix(pkg, "nixpkgs.")
+		if pkg != "" && !existingSet[pkg] {
+			existingSet[pkg] = true
 			addLines.WriteString("    " + pkg + "\n")
 		}
 	}
@@ -462,6 +543,84 @@ func (m *Manager) AddConfigurationNixPackages(packages []string) error {
 		return err
 	}
 	return writeConfigFile(filepath.Join(m.workDir, ".orbit", "configuration.nix"), []byte(updated), 0o644)
+}
+
+// RemoveConfigurationNixPackages removes the given Nixpkgs package attribute names from ~/.config/orbit/configuration.nix
+// and mirrors the updated file into <workDir>/.orbit/configuration.nix.
+func (m *Manager) RemoveConfigurationNixPackages(packages []string) error {
+	pkgs := cleanPackageSlice(packages)
+	if len(pkgs) == 0 {
+		return nil
+	}
+	removeSet := make(map[string]bool, len(pkgs))
+	for _, pkg := range pkgs {
+		pkg = strings.TrimPrefix(pkg, "pkgs.")
+		pkg = strings.TrimPrefix(pkg, "nixpkgs.")
+		if pkg != "" {
+			removeSet[pkg] = true
+		}
+	}
+	m.syncConfigurationNix()
+	homeCfgPath := m.ConfigurationNixPath()
+	data, err := os.ReadFile(homeCfgPath)
+	if err != nil {
+		data = []byte(shellinit.DefaultConfigurationNix)
+	}
+	content := string(data)
+	existing, parseErr := parseConfigurationNixPackages(content)
+	if parseErr != nil {
+		return parseErr
+	}
+	endIdx := strings.LastIndex(content, "];")
+	startIdx := strings.LastIndex(content[:endIdx], "[")
+	var body strings.Builder
+	body.WriteByte('\n')
+	for _, pkg := range existing {
+		if !removeSet[pkg] {
+			body.WriteString("    " + pkg + "\n")
+		}
+	}
+	body.WriteString("  ")
+	updated := content[:startIdx+1] + body.String() + content[endIdx:]
+	if err := writeConfigFile(homeCfgPath, []byte(updated), 0o644); err != nil {
+		return err
+	}
+	return writeConfigFile(filepath.Join(m.workDir, ".orbit", "configuration.nix"), []byte(updated), 0o644)
+}
+
+// InstallConfigurationNixPackages adds the given Nixpkgs package attributes to ~/.config/orbit/configuration.nix
+// and applies the updated configuration immediately.
+func (m *Manager) InstallConfigurationNixPackages(ctx context.Context, packages []string) error {
+	pkgs := cleanPackageSlice(packages)
+	if len(pkgs) == 0 {
+		return fmt.Errorf("%w: at least one package name is required", domain.ErrInvalidConfig)
+	}
+	if err := m.AddConfigurationNixPackages(pkgs); err != nil {
+		return err
+	}
+	return m.ApplyConfigurationNix(ctx)
+}
+
+// UninstallConfigurationNixPackages removes the given Nixpkgs package attributes from ~/.config/orbit/configuration.nix
+// and rebuilds the system profile environment.
+func (m *Manager) UninstallConfigurationNixPackages(ctx context.Context, packages []string) error {
+	pkgs := cleanPackageSlice(packages)
+	if len(pkgs) == 0 {
+		return fmt.Errorf("%w: at least one package name is required", domain.ErrInvalidConfig)
+	}
+	if err := m.RemoveConfigurationNixPackages(pkgs); err != nil {
+		return err
+	}
+	return m.ApplyConfigurationNix(ctx)
+}
+
+// SearchNixPackages searches Nixpkgs for packages matching query.
+func (m *Manager) SearchNixPackages(ctx context.Context, query string) ([]NixPackageResult, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("%w: package search query is required", domain.ErrInvalidConfig)
+	}
+	return m.nixSearcher(ctx, query)
 }
 
 // ApplyConfigurationNix mirrors ~/.config/orbit/configuration.nix into <workDir>/.orbit/configuration.nix,
@@ -828,85 +987,150 @@ func (m *Manager) AutoloadAllWorkspaceFlakes(ctx context.Context) ([]string, err
 	return enabled, nil
 }
 
-type fileSpec struct {
-	data []byte
-	perm os.FileMode
-}
-
 // ConfigureTools configures one or more AI and developer CLI tools ("claude", "agy", "opencode",
 // "codex", "gemini", "cursor", "aider", "gh", "git", or "all") and persists the selections in state.json.
 func (m *Manager) ConfigureTools(selected []string) ([]string, error) {
+	return m.ConfigureToolsWithContext(context.Background(), selected, io.Discard)
+}
+
+// ConfigureToolsWithContext installs missing tool binaries (via ToolInstaller) and writes/merges
+// MCP and CLI configuration files for the selected tools.
+func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []string, out io.Writer) ([]string, error) {
 	tools := normalizeToolSelection(selected)
 	if len(tools) == 0 {
 		return nil, fmt.Errorf("%w: at least one tool must be selected (%s)", domain.ErrInvalidConfig, strings.Join(SupportedTools, ", "))
+	}
+	for _, tool := range tools {
+		if !isSupportedToolName(tool) {
+			return nil, fmt.Errorf("%w: unsupported tool %q", domain.ErrInvalidConfig, tool)
+		}
 	}
 
 	orbitCtx, _ := m.LoadContext()
 	mcpServerURL := fallbackStr(strings.TrimRight(orbitCtx.OrbitURL, "/"), "http://localhost:3000") + "/mcp"
 
-	mcpDoc := map[string]any{
-		"mcpServers": map[string]any{
-			"orbit": map[string]any{
-				"type": "http",
-				"url":  mcpServerURL,
-				"headers": map[string]string{
-					"Authorization": "Bearer " + orbitCtx.OrbitMCPToken,
-				},
-			},
+	orbitServerSpec := map[string]any{
+		"type": "http",
+		"url":  mcpServerURL,
+		"headers": map[string]string{
+			"Authorization": "Bearer " + orbitCtx.OrbitMCPToken,
 		},
 	}
-	mcpBytes, _ := json.MarshalIndent(mcpDoc, "", "  ")
 
 	st, _ := m.LoadState()
 	var configured []string
-	files := make(map[string]fileSpec)
 
 	for _, tool := range tools {
+		if m.toolInstaller != nil {
+			if err := m.toolInstaller(ctx, m.homeDir, tool, out); err != nil {
+				return configured, fmt.Errorf("installing %s: %w", tool, err)
+			}
+		}
+
 		switch tool {
 		case "claude":
-			files[filepath.Join(m.homeDir, ".claude.json")] = fileSpec{mcpBytes, 0o600}
+			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".claude.json"), orbitServerSpec, map[string]any{
+				"hasCompletedOnboarding": true,
+			}); err != nil {
+				return configured, err
+			}
+			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".claude", "settings.json"), orbitServerSpec, nil); err != nil {
+				return configured, err
+			}
 		case "agy":
-			files[filepath.Join(m.homeDir, ".config", "antigravity", "mcp.json")] = fileSpec{mcpBytes, 0o600}
-			files[filepath.Join(m.homeDir, ".gemini", "settings.json")] = fileSpec{mcpBytes, 0o600}
+			for _, p := range []string{
+				filepath.Join(m.homeDir, ".gemini", "config", "mcp_config.json"),
+				filepath.Join(m.homeDir, ".gemini", "antigravity-cli", "settings.json"),
+				filepath.Join(m.homeDir, ".gemini", "settings.json"),
+				filepath.Join(m.homeDir, ".config", "antigravity", "mcp.json"),
+			} {
+				if err := mergeMCPServerIntoJSONFile(p, orbitServerSpec, nil); err != nil {
+					return configured, err
+				}
+			}
 		case "gemini":
-			files[filepath.Join(m.homeDir, ".gemini", "settings.json")] = fileSpec{mcpBytes, 0o600}
+			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".gemini", "settings.json"), orbitServerSpec, nil); err != nil {
+				return configured, err
+			}
 		case "opencode":
-			files[filepath.Join(m.homeDir, ".config", "opencode", "config.json")] = fileSpec{mcpBytes, 0o600}
-			files[filepath.Join(m.homeDir, ".config", "opencode", "opencode.json")] = fileSpec{mcpBytes, 0o600}
+			for _, p := range []string{
+				filepath.Join(m.homeDir, ".config", "opencode", "config.json"),
+				filepath.Join(m.homeDir, ".config", "opencode", "opencode.json"),
+			} {
+				if err := mergeMCPServerIntoJSONFile(p, orbitServerSpec, nil); err != nil {
+					return configured, err
+				}
+			}
 		case "codex":
-			files[filepath.Join(m.homeDir, ".codex", "config.json")] = fileSpec{mcpBytes, 0o600}
+			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".codex", "config.json"), orbitServerSpec, nil); err != nil {
+				return configured, err
+			}
 		case "cursor":
-			files[filepath.Join(m.homeDir, ".cursor", "mcp.json")] = fileSpec{mcpBytes, 0o600}
+			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".cursor", "mcp.json"), orbitServerSpec, nil); err != nil {
+				return configured, err
+			}
 		case "aider":
-			files[filepath.Join(m.homeDir, ".aider.conf.yml")] = fileSpec{[]byte("auto-commits: false\n"), 0o600}
+			if err := writeConfigFile(filepath.Join(m.homeDir, ".aider.conf.yml"), []byte("auto-commits: false\n"), 0o600); err != nil {
+				return configured, err
+			}
 		case "gh":
 			ghYML := []byte("git_protocol: ssh\neditor: vim\nprompt: enabled\n")
-			files[filepath.Join(m.homeDir, ".config", "gh", "config.yml")] = fileSpec{ghYML, 0o600}
+			if err := writeConfigFile(filepath.Join(m.homeDir, ".config", "gh", "config.yml"), ghYML, 0o600); err != nil {
+				return configured, err
+			}
 		case "git":
 			name, email, branch := m.defaultGitIdentity(st, orbitCtx)
 			gitCfg := formatGitConfig(m.homeDir, name, email, branch)
-			files[filepath.Join(m.homeDir, ".gitconfig")] = fileSpec{[]byte(gitCfg), 0o644}
+			if err := writeConfigFile(filepath.Join(m.homeDir, ".gitconfig"), []byte(gitCfg), 0o644); err != nil {
+				return configured, err
+			}
 			st.Git = &GitConfig{
 				UserName:      name,
 				UserEmail:     email,
 				DefaultBranch: branch,
 			}
-		default:
-			return configured, fmt.Errorf("%w: unsupported tool %q", domain.ErrInvalidConfig, tool)
 		}
 		configured = append(configured, tool)
 		st.ConfiguredTools = appendUnique(st.ConfiguredTools, tool)
 	}
 
-	for path, spec := range files {
-		if err := writeConfigFile(path, spec.data, spec.perm); err != nil {
-			return configured, err
-		}
-	}
-
 	_ = m.SaveState(st)
 	_ = m.writeEnvSh(orbitCtx)
+	m.triggerSnapshot()
 	return configured, nil
+}
+
+func isSupportedToolName(tool string) bool {
+	switch tool {
+	case "claude", "agy", "opencode", "codex", "gemini", "cursor", "aider", "gh", "git":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeMCPServerIntoJSONFile(path string, orbitServerSpec map[string]any, defaults map[string]any) error {
+	doc := make(map[string]any)
+	if existing, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(existing)) > 0 {
+		_ = json.Unmarshal(existing, &doc)
+	}
+	for k, v := range defaults {
+		if _, exists := doc[k]; !exists {
+			doc[k] = v
+		}
+	}
+	mcpServers, ok := doc["mcpServers"].(map[string]any)
+	if !ok || mcpServers == nil {
+		mcpServers = make(map[string]any)
+	}
+	mcpServers["orbit"] = orbitServerSpec
+	doc["mcpServers"] = mcpServers
+
+	encoded, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeConfigFile(path, append(encoded, '\n'), 0o600)
 }
 
 // Status inspects the current Orbit context, helper state, SSH key, and workspace directories.
@@ -1038,6 +1262,158 @@ func (m *Manager) runInteractiveSSHKeyWithScanner(scanner *bufio.Scanner, out io
 	}
 }
 
+// RunInteractivePackages runs an interactive submenu for searching Nixpkgs, installing,
+// uninstalling, or listing system packages in ~/.config/orbit/configuration.nix.
+func (m *Manager) RunInteractivePackages(ctx context.Context, in io.Reader, out io.Writer) error {
+	return m.runInteractivePackagesWithScanner(ctx, bufio.NewScanner(in), out)
+}
+
+func (m *Manager) runInteractivePackagesWithScanner(ctx context.Context, scanner *bufio.Scanner, out io.Writer) error {
+	_, _ = fmt.Fprintf(out, "\n📦 System Packages (%s)\n", m.ConfigurationNixPath())
+	_, _ = fmt.Fprintln(out, "  [1] Search nixpkgs & install packages")
+	_, _ = fmt.Fprintln(out, "  [2] Install package(s) by attribute name")
+	_, _ = fmt.Fprintln(out, "  [3] Uninstall package(s)")
+	_, _ = fmt.Fprintln(out, "  [4] List installed system packages")
+	_, _ = fmt.Fprintln(out, "  [b] Back")
+	_, _ = fmt.Fprint(out, "Select an option [1-4/b]: ")
+
+	choice := "1"
+	if scanner.Scan() && strings.TrimSpace(scanner.Text()) != "" {
+		choice = strings.ToLower(strings.TrimSpace(scanner.Text()))
+	}
+
+	switch choice {
+	case "1", "search", "s":
+		_, _ = fmt.Fprint(out, "Search nixpkgs query: ")
+		query := ""
+		if scanner.Scan() {
+			query = strings.TrimSpace(scanner.Text())
+		}
+		if query == "" {
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "⠋ Searching nixpkgs for %q...\n", query)
+		results, err := m.SearchNixPackages(ctx, query)
+		if err != nil {
+			return err
+		}
+		if len(results) == 0 {
+			_, _ = fmt.Fprintf(out, "No packages found matching %q.\n", query)
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "\nFound %d package(s):\n", len(results))
+		for i, r := range results {
+			ver := ""
+			if r.Version != "" {
+				ver = " (" + r.Version + ")"
+			}
+			desc := strings.TrimSpace(r.Description)
+			if desc != "" {
+				desc = " — " + desc
+			}
+			_, _ = fmt.Fprintf(out, "  [%d] %s%s%s\n", i+1, r.Attribute, ver, desc)
+		}
+		_, _ = fmt.Fprint(out, "Enter package numbers or attribute names to install (comma-separated, or blank to cancel): ")
+		rawSel := ""
+		if scanner.Scan() {
+			rawSel = strings.TrimSpace(scanner.Text())
+		}
+		if rawSel == "" {
+			return nil
+		}
+		var toInstall []string
+		for _, tok := range cleanPackageSlice([]string{rawSel}) {
+			if idx, convErr := strconv.Atoi(tok); convErr == nil && idx >= 1 && idx <= len(results) {
+				toInstall = appendUnique(toInstall, results[idx-1].Attribute)
+			} else {
+				toInstall = appendUnique(toInstall, tok)
+			}
+		}
+		if len(toInstall) == 0 {
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "⠋ Installing system packages: %s...\n", strings.Join(toInstall, ", "))
+		if err := m.InstallConfigurationNixPackages(ctx, toInstall); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "✓ Installed system packages: %s\n", strings.Join(toInstall, ", "))
+		return nil
+
+	case "2", "install", "add", "i":
+		_, _ = fmt.Fprint(out, "Enter Nixpkgs attribute names to install (comma/space-separated): ")
+		raw := ""
+		if scanner.Scan() {
+			raw = strings.TrimSpace(scanner.Text())
+		}
+		pkgs := cleanPackageSlice([]string{raw})
+		if len(pkgs) == 0 {
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "⠋ Installing system packages: %s...\n", strings.Join(pkgs, ", "))
+		if err := m.InstallConfigurationNixPackages(ctx, pkgs); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "✓ Installed system packages: %s\n", strings.Join(pkgs, ", "))
+		return nil
+
+	case "3", "uninstall", "remove", "rm", "del":
+		installed, err := m.ListConfigurationNixPackages()
+		if err != nil {
+			return err
+		}
+		if len(installed) == 0 {
+			_, _ = fmt.Fprintln(out, "No packages found in configuration.nix.")
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "\nConfigured system packages (%s):\n", m.ConfigurationNixPath())
+		for i, pkg := range installed {
+			_, _ = fmt.Fprintf(out, "  [%d] %s\n", i+1, pkg)
+		}
+		_, _ = fmt.Fprint(out, "Enter package numbers or attribute names to uninstall (comma-separated, or blank to cancel): ")
+		rawSel := ""
+		if scanner.Scan() {
+			rawSel = strings.TrimSpace(scanner.Text())
+		}
+		if rawSel == "" {
+			return nil
+		}
+		var toRemove []string
+		for _, tok := range cleanPackageSlice([]string{rawSel}) {
+			if idx, convErr := strconv.Atoi(tok); convErr == nil && idx >= 1 && idx <= len(installed) {
+				toRemove = appendUnique(toRemove, installed[idx-1])
+			} else {
+				toRemove = appendUnique(toRemove, tok)
+			}
+		}
+		if len(toRemove) == 0 {
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "⠋ Uninstalling system packages: %s...\n", strings.Join(toRemove, ", "))
+		if err := m.UninstallConfigurationNixPackages(ctx, toRemove); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "✓ Uninstalled system packages: %s\n", strings.Join(toRemove, ", "))
+		return nil
+
+	case "4", "list", "ls":
+		installed, err := m.ListConfigurationNixPackages()
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "\n📦 Installed System Packages (%s):\n", m.ConfigurationNixPath())
+		for _, pkg := range installed {
+			_, _ = fmt.Fprintf(out, "  • %s\n", pkg)
+		}
+		return nil
+
+	case "b", "back", "q", "quit", "0":
+		return nil
+
+	default:
+		return fmt.Errorf("%w: invalid packages option %q", domain.ErrInvalidConfig, choice)
+	}
+}
+
 // RunInteractive runs an interactive terminal menu for orbit-helper.
 func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Writer) error {
 	scanner := bufio.NewScanner(in)
@@ -1047,13 +1423,14 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 		_, _ = fmt.Fprintln(out, "──────────────────────────────────────────────────────────")
 		_, _ = fmt.Fprintln(out, "  [1] Clone & setup workspace repositories (with direnv + Nix flake)")
 		_, _ = fmt.Fprintln(out, "  [2] Initialize or auto-load Nix flake.nix in a repository")
-		_, _ = fmt.Fprintln(out, "  [3] Configure AI & developer tools (multi-select: claude, agy, opencode, gh, git)")
+		_, _ = fmt.Fprintln(out, "  [3] Install & configure AI / developer tools (claude, agy, opencode, codex, gemini, gh, git)")
 		_, _ = fmt.Fprintln(out, "  [4] Show status & save profile snapshot")
 		_, _ = fmt.Fprintln(out, "  [5] Configure Git identity (user.name, user.email, defaultBranch)")
 		_, _ = fmt.Fprintln(out, "  [6] Configure Git SSH key (generate Ed25519 or import key)")
-		_, _ = fmt.Fprintln(out, "  [7] Rebuild Nix system packages (~/.config/orbit/configuration.nix)")
+		_, _ = fmt.Fprintln(out, "  [7] Manage system packages — search nixpkgs, install, or uninstall (~/.config/orbit/configuration.nix)")
+		_, _ = fmt.Fprintln(out, "  [8] Rebuild Nix system packages (~/.config/orbit/configuration.nix)")
 		_, _ = fmt.Fprintln(out, "  [q] Quit")
-		_, _ = fmt.Fprint(out, "\nSelect an option [1-7/q]: ")
+		_, _ = fmt.Fprint(out, "\nSelect an option [1-8/q]: ")
 
 		if !scanner.Scan() {
 			return nil
@@ -1121,17 +1498,21 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 
 		case "3", "tools":
 			_, _ = fmt.Fprintln(out, "\nAvailable tools (select multiple with comma-separated numbers or names, or 'all'):")
-			_, _ = fmt.Fprintln(out, "  [1] claude    — Claude Code CLI (wired to Orbit MCP)")
-			_, _ = fmt.Fprintln(out, "  [2] agy       — Antigravity CLI (wired to Orbit MCP)")
-			_, _ = fmt.Fprintln(out, "  [3] opencode  — OpenCode CLI (wired to Orbit MCP)")
+			_, _ = fmt.Fprintln(out, "  [1] claude    — Claude Code CLI (installed & wired to Orbit MCP)")
+			_, _ = fmt.Fprintln(out, "  [2] agy       — Antigravity CLI (installed & wired to Orbit MCP)")
+			_, _ = fmt.Fprintln(out, "  [3] opencode  — OpenCode CLI (installed & wired to Orbit MCP)")
 			_, _ = fmt.Fprintln(out, "  [4] gh        — GitHub CLI configuration")
 			_, _ = fmt.Fprintln(out, "  [5] git       — Git identity & SSH configuration")
+			_, _ = fmt.Fprintln(out, "  [6] codex     — OpenAI Codex CLI (installed & wired to Orbit MCP)")
+			_, _ = fmt.Fprintln(out, "  [7] gemini    — Gemini CLI (installed & wired to Orbit MCP)")
+			_, _ = fmt.Fprintln(out, "  [8] aider     — Aider CLI configuration")
+			_, _ = fmt.Fprintln(out, "  [9] cursor    — Cursor MCP configuration")
 			_, _ = fmt.Fprint(out, "Select tools [all]: ")
 			rawSel := "all"
 			if scanner.Scan() && strings.TrimSpace(scanner.Text()) != "" {
 				rawSel = strings.TrimSpace(scanner.Text())
 			}
-			configured, err := m.ConfigureTools(strings.Split(rawSel, ","))
+			configured, err := m.ConfigureToolsWithContext(ctx, strings.Split(rawSel, ","), out)
 			if err != nil {
 				_, _ = fmt.Fprintf(out, "Error: %v\n", err)
 			} else {
@@ -1154,7 +1535,12 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 				_, _ = fmt.Fprintf(out, "Error: %v\n", err)
 			}
 
-		case "7", "rebuild", "config-nix":
+		case "7", "packages", "pkg", "pkgs", "deps":
+			if err := m.runInteractivePackagesWithScanner(ctx, scanner, out); err != nil {
+				_, _ = fmt.Fprintf(out, "Error: %v\n", err)
+			}
+
+		case "8", "rebuild", "config-nix":
 			_, _ = fmt.Fprintf(out, "\n📦 Declarative Nix Configuration: %s\n", m.ConfigurationNixPath())
 			_, _ = fmt.Fprint(out, "Extra Nixpkgs packages to add (comma-separated, or blank to apply current file): ")
 			if scanner.Scan() && strings.TrimSpace(scanner.Text()) != "" {
@@ -1307,6 +1693,8 @@ func (m *Manager) writeEnvSh(ctxData OrbitContext) error {
 	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	b.WriteString("export GIT_TERMINAL_PROMPT=0\n")
 	_, _ = fmt.Fprintf(&b, "export GIT_SSH_COMMAND=%q\n", sshCmd)
+	_, _ = fmt.Fprintf(&b, "export NPM_CONFIG_PREFIX=%q\n", filepath.Join(m.homeDir, ".local"))
+	_, _ = fmt.Fprintf(&b, "export PATH=\"%s/.local/bin:%s/.nix-profile/bin:$PATH\"\n", m.homeDir, m.homeDir)
 	for _, kv := range [][2]string{
 		{"ORBIT_URL", ctxData.OrbitURL},
 		{"ORBIT_MCP_TOKEN", ctxData.OrbitMCPToken},
@@ -1340,11 +1728,20 @@ func resolveInteractiveCloneOptions(repos []protocol.RepoCredential, rawSel stri
 
 func normalizeToolSelection(raw []string) []string {
 	NumberToTool := map[string]string{
-		"1": "claude",
-		"2": "agy",
-		"3": "opencode",
-		"4": "gh",
-		"5": "git",
+		"1":               "claude",
+		"2":               "agy",
+		"3":               "opencode",
+		"4":               "gh",
+		"5":               "git",
+		"6":               "codex",
+		"7":               "gemini",
+		"8":               "aider",
+		"9":               "cursor",
+		"antigravity":     "agy",
+		"antigravity-cli": "agy",
+		"claude-code":     "claude",
+		"opencode-ai":     "opencode",
+		"gemini-cli":      "gemini",
 	}
 	var out []string
 	for _, item := range raw {
@@ -1482,6 +1879,348 @@ func defaultNixEnvRunner(ctx context.Context, homeDir, configNixPath string) err
 		return fmt.Errorf("nix-env -i -f %s failed: %w (%s)", configNixPath, runErr, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func toolInstallEnv(homeDir string) []string {
+	env := gitEnvForHome(homeDir)
+	localDir := filepath.Join(homeDir, ".local")
+	localBin := filepath.Join(localDir, "bin")
+	nixBin := filepath.Join(homeDir, ".nix-profile", "bin")
+	extraPath := strings.Join([]string{
+		localBin,
+		nixBin,
+		"/nix/var/nix/profiles/per-user/orbit/profile/bin",
+		"/nix/var/nix/profiles/orbit/bin",
+		"/root/.nix-profile/bin",
+		"/nix/var/nix/profiles/default/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+		os.Getenv("PATH"),
+	}, ":")
+	env = append(env,
+		"HOME="+homeDir,
+		"NPM_CONFIG_PREFIX="+localDir,
+		"PATH="+extraPath,
+	)
+	return env
+}
+
+func lookToolBinary(homeDir, binName string) (string, bool) {
+	for _, candidate := range []string{
+		filepath.Join(homeDir, ".local", "bin", binName),
+		filepath.Join(homeDir, ".nix-profile", "bin", binName),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	isRunnerBin := binName == "npm" || binName == "bash" || binName == "curl" || binName == "nix" || binName == "nix-env"
+	if os.Getenv("ORBIT_TEST_REAL_TOOL_INSTALLER") == "" || isRunnerBin {
+		if p, err := exec.LookPath(binName); err == nil {
+			return p, true
+		}
+	}
+	if os.Getenv("ORBIT_TEST_REAL_TOOL_INSTALLER") == "" {
+		for _, sysCandidate := range []string{
+			filepath.Join("/nix/var/nix/profiles/per-user/orbit/profile/bin", binName),
+			filepath.Join("/nix/var/nix/profiles/orbit/bin", binName),
+		} {
+			if info, err := os.Stat(sysCandidate); err == nil && !info.IsDir() {
+				return sysCandidate, true
+			}
+		}
+	}
+	return "", false
+}
+
+func defaultToolInstaller(ctx context.Context, homeDir, tool string, out io.Writer) error {
+	if testing.Testing() && os.Getenv("ORBIT_TEST_REAL_TOOL_INSTALLER") == "" {
+		return nil
+	}
+	localBin := filepath.Join(homeDir, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", localBin, err)
+	}
+	if out == nil {
+		out = io.Discard
+	}
+
+	switch tool {
+	case "claude":
+		if _, ok := lookToolBinary(homeDir, "claude"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing Claude Code CLI (@anthropic-ai/claude-code)...")
+		if err := installNPMGlobalTool(ctx, homeDir, "@anthropic-ai/claude-code", "claude-code"); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed Claude Code CLI")
+		return nil
+
+	case "agy":
+		if _, ok := lookToolBinary(homeDir, "agy"); !ok {
+			_, _ = fmt.Fprintln(out, "⠋ Installing Antigravity CLI (agy)...")
+			if err := installAntigravityCLI(ctx, homeDir, localBin); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintln(out, "✓ Installed Antigravity CLI (agy)")
+		}
+		agyBin := filepath.Join(localBin, "agy")
+		if _, err := os.Stat(agyBin); err == nil {
+			aliasLink := filepath.Join(localBin, "antigravity-cli")
+			_ = os.Remove(aliasLink)
+			_ = os.Symlink(agyBin, aliasLink)
+		}
+		return nil
+
+	case "opencode":
+		if _, ok := lookToolBinary(homeDir, "opencode"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing OpenCode CLI (opencode-ai)...")
+		if err := installNPMGlobalTool(ctx, homeDir, "opencode-ai", "opencode"); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed OpenCode CLI")
+		return nil
+
+	case "codex":
+		if _, ok := lookToolBinary(homeDir, "codex"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing OpenAI Codex CLI (@openai/codex)...")
+		if err := installNPMGlobalTool(ctx, homeDir, "@openai/codex", ""); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed OpenAI Codex CLI")
+		return nil
+
+	case "gemini":
+		if _, ok := lookToolBinary(homeDir, "gemini"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing Gemini CLI (@google/gemini-cli)...")
+		if err := installNPMGlobalTool(ctx, homeDir, "@google/gemini-cli", "gemini-cli"); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed Gemini CLI")
+		return nil
+
+	case "aider":
+		if _, ok := lookToolBinary(homeDir, "aider"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing Aider CLI (nixpkgs.aider-chat)...")
+		if err := installNixEnvAttr(ctx, homeDir, "nixpkgs.aider-chat"); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed Aider CLI")
+		return nil
+
+	case "gh":
+		if _, ok := lookToolBinary(homeDir, "gh"); ok {
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "⠋ Installing GitHub CLI (nixpkgs.gh)...")
+		if err := installNixEnvAttr(ctx, homeDir, "nixpkgs.gh"); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(out, "✓ Installed GitHub CLI")
+		return nil
+
+	default:
+		return nil
+	}
+}
+
+func installNPMGlobalTool(ctx context.Context, homeDir, npmPkg, nixFallbackAttr string) error {
+	if npmPath, ok := lookToolBinary(homeDir, "npm"); ok {
+		prefix := filepath.Join(homeDir, ".local")
+		cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "--prefix", prefix, npmPkg)
+		cmd.Env = toolInstallEnv(homeDir)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		if nixFallbackAttr == "" {
+			return fmt.Errorf("npm install -g %s failed: %w (%s)", npmPkg, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if nixFallbackAttr != "" {
+		return installNixEnvAttr(ctx, homeDir, "nixpkgs."+nixFallbackAttr)
+	}
+	return fmt.Errorf("npm not found in PATH to install %s", npmPkg)
+}
+
+func installAntigravityCLI(ctx context.Context, homeDir, localBin string) error {
+	bashPath, ok := lookToolBinary(homeDir, "bash")
+	if !ok {
+		bashPath = "/bin/sh"
+	}
+	script := "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir \"$1\""
+	cmd := exec.CommandContext(ctx, bashPath, "-c", script, "--", localBin)
+	cmd.Env = toolInstallEnv(homeDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("antigravity installer failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func installNixEnvAttr(ctx context.Context, homeDir, attr string) error {
+	nixEnvPath, ok := lookToolBinary(homeDir, "nix-env")
+	if !ok {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, nixEnvPath, "-iA", attr)
+	cmd.Env = toolInstallEnv(homeDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nix-env -iA %s failed: %w (%s)", attr, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func defaultNixSearcher(ctx context.Context, homeDir, query string) ([]NixPackageResult, error) {
+	env := toolInstallEnv(homeDir)
+	if nixPath, ok := lookToolBinary(homeDir, "nix"); ok {
+		for _, args := range [][]string{
+			{"--extra-experimental-features", "nix-command flakes", "search", "--impure", "--expr", "import <nixpkgs> {}", query, "--json"},
+			{"--extra-experimental-features", "nix-command flakes", "search", "nixpkgs", query, "--json"},
+		} {
+			cmd := exec.CommandContext(ctx, nixPath, args...)
+			cmd.Env = env
+			if out, err := cmd.Output(); err == nil && len(bytes.TrimSpace(out)) > 0 {
+				if results, parseErr := ParseNixSearchJSON(out, query); parseErr == nil && len(results) > 0 {
+					return results, nil
+				}
+			}
+		}
+	}
+	if nixEnvPath, ok := lookToolBinary(homeDir, "nix-env"); ok {
+		cmd := exec.CommandContext(ctx, nixEnvPath, "-qaP", "--description", ".*"+query+".*")
+		cmd.Env = env
+		if out, err := cmd.Output(); err == nil && len(bytes.TrimSpace(out)) > 0 {
+			return ParseNixEnvSearchOutput(string(out), query), nil
+		}
+	}
+	return nil, nil
+}
+
+// ParseNixSearchJSON parses the JSON output of `nix search nixpkgs <query> --json` and sorts results by relevance.
+func ParseNixSearchJSON(raw []byte, query string) ([]NixPackageResult, error) {
+	type rawEntry struct {
+		Pname       string `json:"pname"`
+		Version     string `json:"version"`
+		Description string `json:"description"`
+	}
+	var parsed map[string]rawEntry
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, err
+	}
+	var results []NixPackageResult
+	seen := make(map[string]bool, len(parsed))
+	for fullAttr, entry := range parsed {
+		attr := cleanNixSearchAttr(fullAttr)
+		if attr == "" || seen[attr] {
+			continue
+		}
+		seen[attr] = true
+		results = append(results, NixPackageResult{
+			Attribute:   attr,
+			Name:        fallbackStr(entry.Pname, attr),
+			Version:     entry.Version,
+			Description: entry.Description,
+		})
+	}
+	return sortAndLimitNixResults(results, query, 25), nil
+}
+
+// ParseNixEnvSearchOutput parses the text output of `nix-env -qaP --description <query>`.
+func ParseNixEnvSearchOutput(raw, query string) []NixPackageResult {
+	var results []NixPackageResult
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		attr := cleanNixSearchAttr(fields[0])
+		if attr == "" || seen[attr] {
+			continue
+		}
+		seen[attr] = true
+		nameVer := fields[1]
+		desc := ""
+		if idx := strings.Index(line, fields[1]); idx >= 0 {
+			desc = strings.TrimSpace(line[idx+len(fields[1]):])
+		}
+		results = append(results, NixPackageResult{
+			Attribute:   attr,
+			Name:        nameVer,
+			Description: desc,
+		})
+	}
+	return sortAndLimitNixResults(results, query, 25)
+}
+
+func cleanNixSearchAttr(fullAttr string) string {
+	trimmed := strings.TrimSpace(fullAttr)
+	parts := strings.Split(trimmed, ".")
+	if len(parts) >= 3 && (parts[0] == "legacyPackages" || parts[0] == "packages") {
+		return strings.Join(parts[2:], ".")
+	}
+	if len(parts) >= 2 && (parts[0] == "nixpkgs" || parts[0] == "pkgs") {
+		return strings.Join(parts[1:], ".")
+	}
+	return trimmed
+}
+
+func sortAndLimitNixResults(results []NixPackageResult, query string, limit int) []NixPackageResult {
+	q := strings.ToLower(strings.TrimSpace(query))
+	rank := func(r NixPackageResult) int {
+		attr := strings.ToLower(r.Attribute)
+		name := strings.ToLower(r.Name)
+		switch {
+		case attr == q || name == q:
+			return 0
+		case strings.HasPrefix(attr, q) || strings.HasPrefix(name, q):
+			return 1
+		case strings.Contains(attr, q) || strings.Contains(name, q):
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		ri, rj := rank(results[i]), rank(results[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if len(results[i].Attribute) != len(results[j].Attribute) {
+			return len(results[i].Attribute) < len(results[j].Attribute)
+		}
+		return results[i].Attribute < results[j].Attribute
+	})
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	return results
+}
+
+func cleanPackageSlice(in []string) []string {
+	var out []string
+	for _, s := range in {
+		for _, part := range strings.FieldsFunc(s, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '\n'
+		}) {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				out = appendUnique(out, trimmed)
+			}
+		}
+	}
+	return out
 }
 
 func writeConfigFile(path string, data []byte, perm os.FileMode) error {

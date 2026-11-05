@@ -103,12 +103,15 @@ func TestEnsureInitialized_WritesStarshipJetpackDirenvAndWelcomeBashrc(t *testin
 		`eval "$(direnv hook bash)"`,
 		`eval "$(starship init bash)"`,
 		"STARSHIP_CONFIG",
+		"NPM_CONFIG_PREFIX=",
+		"/.local/bin:",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_SSH_COMMAND=",
 		"if [[ $- == *i* ]]; then",
 		"Welcome to Orbit Machine",
 		"orbit repos",
 		"orbit flake init [stack]",
+		"orbit packages",
 		"orbit tools [tool...]",
 		"orbit git",
 		"orbit ssh-key",
@@ -184,5 +187,23 @@ func TestEnsureInitialized_WritesStarshipJetpackDirenvAndWelcomeBashrc(t *testin
 	_ = os.MkdirAll(filepath.Join(homeDir4, ".bashrc"), 0o755)
 	if err := shellinit.EnsureInitialized(homeDir4, filepath.Join(homeDir4, "ws")); err == nil {
 		t.Fatalf("expected error when .bashrc is a directory")
+	}
+
+	// Verify legacy configuration.nix without nodejs is upgraded automatically and pre-existing .local/bin files migrate to workspace PVC
+	homeDir5 := filepath.Join(t.TempDir(), "home5")
+	workDir5 := filepath.Join(homeDir5, "workspace")
+	_ = os.MkdirAll(filepath.Join(homeDir5, ".config", "orbit"), 0o755)
+	_ = os.WriteFile(filepath.Join(homeDir5, ".config", "orbit", "configuration.nix"), []byte("pkgs.buildEnv {\n  paths = with pkgs; [\n    git\n  ];\n}\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(homeDir5, ".local", "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(homeDir5, ".local", "bin", "agy"), []byte("#!/bin/sh\n"), 0o755)
+	if err := shellinit.EnsureInitialized(homeDir5, workDir5); err != nil {
+		t.Fatalf("EnsureInitialized homeDir5: %v", err)
+	}
+	cfgNix5, _ := os.ReadFile(filepath.Join(homeDir5, ".config", "orbit", "configuration.nix"))
+	if !strings.Contains(string(cfgNix5), "nodejs") {
+		t.Fatalf("expected legacy configuration.nix to be upgraded with nodejs, got:\n%s", string(cfgNix5))
+	}
+	if _, err := os.Stat(filepath.Join(workDir5, ".orbit", "local", "bin", "agy")); err != nil {
+		t.Fatalf("expected pre-existing .local/bin/agy to be migrated to workspace .orbit/local/bin/agy: %v", err)
 	}
 }

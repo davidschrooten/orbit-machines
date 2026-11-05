@@ -24,6 +24,14 @@ func TestOrbitHelperCLI_Subcommands(t *testing.T) {
 		},
 		DirenvAllower: func(_ context.Context, _ string) error { return nil },
 		NixEnvRunner:  func(_ context.Context, _ string) error { return nil },
+		NixSearcher: func(_ context.Context, query string) ([]helper.NixPackageResult, error) {
+			if query == "empty" {
+				return nil, nil
+			}
+			return []helper.NixPackageResult{
+				{Attribute: "postgresql", Name: "postgresql", Version: "16.4", Description: "PostgreSQL database"},
+			}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -147,6 +155,30 @@ func TestOrbitHelperCLI_Subcommands(t *testing.T) {
 	}
 	if code, out, errOut := execCLI("", "rebuild", "--add", "tmux", "neovim"); code != 0 || !strings.Contains(out, "Applied Nix packages") {
 		t.Fatalf("rebuild --add failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "rebuild", "--remove", "tmux"); code != 0 || !strings.Contains(out, "Applied Nix packages") {
+		t.Fatalf("rebuild --remove failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "install", "postgresql", "redis"); code != 0 || !strings.Contains(out, "postgresql") {
+		t.Fatalf("packages install failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "search", "postgres"); code != 0 || !strings.Contains(out, "postgresql (16.4)") {
+		t.Fatalf("packages search failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "search", "empty"); code != 0 || !strings.Contains(out, "No packages found") {
+		t.Fatalf("packages search empty failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "list"); code != 0 || !strings.Contains(out, "postgresql") {
+		t.Fatalf("packages list failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "uninstall", "redis"); code != 0 || !strings.Contains(out, "redis") {
+		t.Fatalf("packages uninstall failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "packages", "htop"); code != 0 || !strings.Contains(out, "htop") {
+		t.Fatalf("packages shorthand install failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("4\n", "packages"); code != 0 || !strings.Contains(out, "Installed System Packages") {
+		t.Fatalf("packages interactive list failed: code=%d out=%q err=%q", code, out, errOut)
 	}
 
 	// 7. default interactive menu (root command & menu subcommand)

@@ -157,8 +157,9 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		}
 
 		mgr, _ := helper.NewManager(helper.Config{
-			HomeDir: homeDir,
-			WorkDir: cfg.WorkDir,
+			HomeDir:       homeDir,
+			WorkDir:       cfg.WorkDir,
+			ToolInstaller: helper.NoopToolInstaller,
 		})
 		if mgr != nil {
 			if initCtx, err := mgr.LoadContext(); err == nil {

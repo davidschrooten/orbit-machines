@@ -198,14 +198,14 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 	var selectedTools []string
 	toolsCmd := &cobra.Command{
 		Use:   "tools [tool...]",
-		Short: "Configure multiple AI and developer tools (claude, codex, gemini, opencode, cursor, aider, agy, gh, git, or all)",
+		Short: "Install and configure multiple AI and developer tools (claude, codex, gemini, opencode, cursor, aider, agy, gh, git, or all)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			tools := append([]string(nil), selectedTools...)
 			tools = append(tools, args...)
 			if len(tools) == 0 {
 				tools = []string{"all"}
 			}
-			configured, err := mgr.ConfigureTools(tools)
+			configured, err := mgr.ConfigureToolsWithContext(cmd.Context(), tools, cmd.OutOrStdout())
 			if err != nil {
 				return err
 			}
@@ -326,8 +326,9 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 	}
 
 	var (
-		rebuildPrintPath bool
-		rebuildAddPkgs   []string
+		rebuildPrintPath  bool
+		rebuildAddPkgs    []string
+		rebuildRemovePkgs []string
 	)
 	rebuildCmd := &cobra.Command{
 		Use:     "rebuild [package...]",
@@ -345,6 +346,11 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 					return err
 				}
 			}
+			if len(rebuildRemovePkgs) > 0 {
+				if err := mgr.RemoveConfigurationNixPackages(rebuildRemovePkgs); err != nil {
+					return err
+				}
+			}
 			if err := mgr.ApplyConfigurationNix(cmd.Context()); err != nil {
 				return err
 			}
@@ -354,6 +360,78 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 	}
 	rebuildCmd.Flags().BoolVar(&rebuildPrintPath, "path", false, "Print the path to ~/.config/orbit/configuration.nix")
 	rebuildCmd.Flags().StringSliceVar(&rebuildAddPkgs, "add", nil, "Add Nixpkgs attribute names to configuration.nix before rebuilding")
+	rebuildCmd.Flags().StringSliceVar(&rebuildRemovePkgs, "remove", nil, "Remove Nixpkgs attribute names from configuration.nix before rebuilding")
+
+	packagesCmd := &cobra.Command{
+		Use:     "packages [search|install|uninstall|list] [args...]",
+		Aliases: []string{"pkg", "pkgs", "deps"},
+		Short:   "Search nixpkgs, install, uninstall, or list system packages in ~/.config/orbit/configuration.nix",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return mgr.RunInteractivePackages(cmd.Context(), stdin, cmd.OutOrStdout())
+			}
+			action := strings.ToLower(strings.TrimSpace(args[0]))
+			rest := args[1:]
+			switch action {
+			case "search", "find", "s":
+				query := strings.TrimSpace(strings.Join(rest, " "))
+				results, err := mgr.SearchNixPackages(cmd.Context(), query)
+				if err != nil {
+					return err
+				}
+				if len(results) == 0 {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "No packages found matching %q.\n", query)
+					return nil
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "📦 Nixpkgs search results for %q:\n", query)
+				for _, r := range results {
+					ver := ""
+					if r.Version != "" {
+						ver = " (" + r.Version + ")"
+					}
+					desc := strings.TrimSpace(r.Description)
+					if desc != "" {
+						desc = " — " + desc
+					}
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  • %s%s%s\n", r.Attribute, ver, desc)
+				}
+				return nil
+
+			case "install", "add", "i":
+				if err := mgr.InstallConfigurationNixPackages(cmd.Context(), rest); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Installed system packages: %s\n", strings.Join(rest, ", "))
+				return nil
+
+			case "uninstall", "remove", "rm", "del":
+				if err := mgr.UninstallConfigurationNixPackages(cmd.Context(), rest); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Uninstalled system packages: %s\n", strings.Join(rest, ", "))
+				return nil
+
+			case "list", "ls":
+				installed, err := mgr.ListConfigurationNixPackages()
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "📦 Installed System Packages (%s):\n", mgr.ConfigurationNixPath())
+				for _, pkg := range installed {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  • %s\n", pkg)
+				}
+				return nil
+
+			default:
+				// Treat `orbit packages <pkg1> <pkg2>` as shorthand for `orbit packages install <pkg1> <pkg2>`
+				if err := mgr.InstallConfigurationNixPackages(cmd.Context(), args); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Installed system packages: %s\n", strings.Join(args, ", "))
+				return nil
+			}
+		},
+	}
 
 	versionCmd := &cobra.Command{
 		Use:   "version",
@@ -363,6 +441,6 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		},
 	}
 
-	rootCmd.AddCommand(menuCmd, initCmd, reposCmd, flakeCmd, toolsCmd, gitCmd, sshKeyCmd, statusCmd, saveCmd, rebuildCmd, versionCmd)
+	rootCmd.AddCommand(menuCmd, initCmd, reposCmd, flakeCmd, toolsCmd, gitCmd, sshKeyCmd, statusCmd, saveCmd, rebuildCmd, packagesCmd, versionCmd)
 	return rootCmd
 }
