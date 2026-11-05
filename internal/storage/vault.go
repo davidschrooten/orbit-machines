@@ -38,8 +38,14 @@ const magicHeader = "ORBM"
 
 // DefaultProfileWhitelist lists user home relative paths synced across ephemeral Pods.
 var DefaultProfileWhitelist = []string{
+	".ssh",
+	".gitconfig",
+	".config/orbit",
 	".config/orbit-machine",
+	".config/gh",
+	".config/antigravity",
 	".claude",
+	".claude.json",
 	".config/opencode",
 	".gemini",
 }
@@ -396,6 +402,9 @@ func (v *ProfileVault) HydrateProfile(ctx context.Context, mid domain.MachineID,
 			return false, err
 		}
 		_ = os.MkdirAll(filepath.Dir(targetPath), 0o755)
+		if strings.HasPrefix(filepath.ToSlash(hdr.Name), ".ssh/") {
+			_ = os.Chmod(filepath.Join(homeDir, ".ssh"), 0o700)
+		}
 		content, _ := io.ReadAll(io.LimitReader(tr, 64<<20))
 		mode := fs.FileMode(hdr.Mode) & 0o777
 		if mode == 0 {
@@ -404,6 +413,7 @@ func (v *ProfileVault) HydrateProfile(ctx context.Context, mid domain.MachineID,
 		if err := os.WriteFile(targetPath, content, mode); err != nil {
 			return false, err
 		}
+		_ = os.Chmod(targetPath, mode)
 	}
 	return true, nil
 }

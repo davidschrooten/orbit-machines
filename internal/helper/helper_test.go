@@ -429,6 +429,42 @@ func TestManager_GitAndSSHKeyPersistenceAndRestoration(t *testing.T) {
 	if _, err := mgr.SetSSHKey(unknownPEM); !errors.Is(err, domain.ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for unsupported PEM key")
 	}
+
+	// 11. Simulate Pod restart with a completely fresh homeDir2 sharing the persistent workDir PVC:
+	// NewManager(homeDir2, workDir) automatically restores ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, ~/.ssh/config, and ~/.gitconfig!
+	freshHomeDir := filepath.Join(t.TempDir(), "fresh-pod-home")
+	restartedMgr, err := helper.NewManager(helper.Config{
+		HomeDir: freshHomeDir,
+		WorkDir: workDir,
+	})
+	if err != nil {
+		t.Fatalf("NewManager on freshHomeDir: %v", err)
+	}
+	restartedPub, err := restartedMgr.PublicSSHKey()
+	if err != nil || restartedPub == "" {
+		t.Fatalf("expected SSH public key to be restored in freshHomeDir, got (%q, %v)", restartedPub, err)
+	}
+	for _, rel := range []string{".ssh/id_ed25519", ".ssh/id_ed25519.pub", ".ssh/config", ".gitconfig", ".config/orbit/state.json"} {
+		if _, err := os.Stat(filepath.Join(freshHomeDir, rel)); err != nil {
+			t.Fatalf("expected %s to exist in freshHomeDir after Pod restart: %v", rel, err)
+		}
+	}
+
+	// 12. Simulate existing ~/.ssh/id_ed25519 on disk without state.json -> EnsureGitAndSSH backfills State.SSHKey
+	diskOnlyHome := filepath.Join(t.TempDir(), "disk-only-home")
+	diskOnlyWork := filepath.Join(t.TempDir(), "disk-only-work")
+	_ = os.MkdirAll(filepath.Join(diskOnlyHome, ".ssh"), 0o700)
+	_ = os.WriteFile(filepath.Join(diskOnlyHome, ".ssh", "id_ed25519"), []byte(sshCfg.PrivateKey), 0o600)
+	diskMgr, err := helper.NewManager(helper.Config{
+		HomeDir: diskOnlyHome,
+		WorkDir: diskOnlyWork,
+	})
+	if err != nil {
+		t.Fatalf("NewManager on diskOnlyHome: %v", err)
+	}
+	if pub, err := diskMgr.PublicSSHKey(); err != nil || !strings.HasPrefix(pub, "ssh-ed25519 ") {
+		t.Fatalf("expected diskOnlyHome SSH key to be discovered and derived, got (%q, %v)", pub, err)
+	}
 }
 
 func TestManager_InteractiveMenuAndEnvFallbacks(t *testing.T) {

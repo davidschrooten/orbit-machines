@@ -22,6 +22,7 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/domain"
 	"github.com/davidschrooten/orbit-machines/internal/helper"
 	"github.com/davidschrooten/orbit-machines/internal/pty"
+	"github.com/davidschrooten/orbit-machines/internal/storage"
 	"github.com/davidschrooten/orbit-machines/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -125,6 +126,16 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		logger := slog.New(slog.NewJSONHandler(logOut, nil))
 		homeDir := resolveHomeDir(cfg.WorkDir)
 
+		var vault *storage.ProfileVault
+		if strings.TrimSpace(cfg.S3Endpoint) != "" && len(cfg.ProfileEncryptionKey) == 32 {
+			if store, storeErr := storage.NewHTTPObjectStore(cfg.S3Endpoint, nil); storeErr == nil {
+				if v, vErr := storage.NewProfileVault(store, cfg.S3ProfileBucket, cfg.ProfileEncryptionKey); vErr == nil {
+					vault = v
+					_, _ = vault.HydrateProfile(ctx, cfg.MachineID, homeDir)
+				}
+			}
+		}
+
 		mgr, _ := helper.NewManager(helper.Config{
 			HomeDir: homeDir,
 			WorkDir: cfg.WorkDir,
@@ -146,6 +157,12 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 			WorkspaceDir: cfg.WorkDir,
 			ShellSpawner: func(spawnCtx context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 				return spawnShellPane(spawnCtx, homeDir, cfg.WorkDir, tabID, "Starship Shell ("+tabID+")", cols, rows), nil
+			},
+			OnSnapshot: func(snapCtx context.Context) ([]string, error) {
+				if vault != nil {
+					_ = vault.SnapshotProfile(snapCtx, cfg.MachineID, homeDir)
+				}
+				return nil, nil
 			},
 			OnContextUpdate: func(req tui.ContextUpdateRequest) error {
 				return applyContextUpdate(mgr, req)
@@ -184,6 +201,9 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		case <-ctx.Done():
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			if vault != nil {
+				_ = vault.SnapshotProfile(shutCtx, cfg.MachineID, homeDir)
+			}
 			_ = httpSrv.Shutdown(shutCtx)
 			return <-errCh
 		case serveErr := <-errCh:

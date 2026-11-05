@@ -49,6 +49,7 @@ type PodRequest struct {
 	OrbitURL                string
 	OrbitMCPToken           string
 	RepositoriesJSON        string
+	WorkspacePVCName        string
 }
 
 // PodEndpoint contains routing details for an active or provisioning Machine Pod.
@@ -133,13 +134,33 @@ type SeccompProfile struct {
 
 // Volume represents a Pod volume.
 type Volume struct {
-	Name     string          `json:"name"`
-	EmptyDir *EmptyDirVolume `json:"emptyDir,omitempty"`
+	Name                  string           `json:"name"`
+	EmptyDir              *EmptyDirVolume  `json:"emptyDir,omitempty"`
+	PersistentVolumeClaim *PVCVolumeSource `json:"persistentVolumeClaim,omitempty"`
 }
 
 // EmptyDirVolume configures an ephemeral emptyDir volume.
 type EmptyDirVolume struct {
 	SizeLimit string `json:"sizeLimit,omitempty"`
+}
+
+// PVCVolumeSource binds a Pod volume to a PersistentVolumeClaim.
+type PVCVolumeSource struct {
+	ClaimName string `json:"claimName"`
+}
+
+// PVCManifest is a lightweight JSON-serializable representation of a Kubernetes core/v1 PersistentVolumeClaim.
+type PVCManifest struct {
+	APIVersion string     `json:"apiVersion"`
+	Kind       string     `json:"kind"`
+	Metadata   ObjectMeta `json:"metadata"`
+	Spec       PVCSpec    `json:"spec"`
+}
+
+// PVCSpec holds the Kubernetes PersistentVolumeClaim specification.
+type PVCSpec struct {
+	AccessModes []string             `json:"accessModes"`
+	Resources   ResourceRequirements `json:"resources"`
 }
 
 // Container represents a single container inside a Pod.
@@ -247,6 +268,17 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 		env = append(env, EnvVar{Name: "ORBIT_USER_EMAIL", Value: req.UserEmail})
 	}
 
+	workspaceVolume := Volume{
+		Name:     "workspace",
+		EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
+	}
+	if pvcName := strings.TrimSpace(req.WorkspacePVCName); pvcName != "" {
+		workspaceVolume = Volume{
+			Name:                  "workspace",
+			PersistentVolumeClaim: &PVCVolumeSource{ClaimName: pvcName},
+		}
+	}
+
 	return PodManifest{
 		APIVersion: "v1",
 		Kind:       "Pod",
@@ -281,10 +313,7 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 					Name:     "nix-store",
 					EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
 				},
-				{
-					Name:     "workspace",
-					EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
-				},
+				workspaceVolume,
 			},
 			Containers: []Container{
 				{
@@ -395,6 +424,12 @@ func (o *HTTPPodOrchestrator) EnsurePod(ctx context.Context, req PodRequest) (Po
 		return PodEndpoint{}, fmt.Errorf("%w: %d/%d active pods", ErrClusterCapacityReached, len(active), o.maxConcurrentPods)
 	}
 
+	if strings.TrimSpace(req.WorkspacePVCName) == "" {
+		if pvcName, pvcErr := o.ensureWorkspacePVC(ctx, req); pvcErr == nil && pvcName != "" {
+			req.WorkspacePVCName = pvcName
+		}
+	}
+
 	manifest := BuildPodManifest(o.manifestCfg, req)
 	body, err := json.Marshal(manifest)
 	if err != nil {
@@ -407,6 +442,53 @@ func (o *HTTPPodOrchestrator) EnsurePod(ctx context.Context, req PodRequest) (Po
 		return PodEndpoint{}, fmt.Errorf("creating pod %s: %w", manifest.Metadata.Name, err)
 	}
 	return podEndpointFromManifest(created), nil
+}
+
+func (o *HTTPPodOrchestrator) ensureWorkspacePVC(ctx context.Context, req PodRequest) (string, error) {
+	pvcName := req.MachineID.PodName() + "-ws"
+	getURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", o.apiServerURL, o.manifestCfg.Namespace, pvcName)
+	var existing PVCManifest
+	if err := o.doJSON(ctx, http.MethodGet, getURL, nil, &existing); err == nil {
+		return pvcName, nil
+	} else if !errors.Is(err, ErrPodNotFound) {
+		return "", nil
+	}
+
+	tier := req.Tier
+	if tier == "" {
+		tier = domain.TierStandard
+	}
+	specs := tier.Specs()
+	pvc := PVCManifest{
+		APIVersion: "v1",
+		Kind:       "PersistentVolumeClaim",
+		Metadata: ObjectMeta{
+			Name:      pvcName,
+			Namespace: o.manifestCfg.Namespace,
+			Labels: map[string]string{
+				LabelAppName:      "orbit-machine",
+				LabelManagedBy:    "orbit-dispatcher",
+				LabelWorkspaceID:  req.MachineID.WorkspaceID(),
+				LabelUserID:       req.MachineID.UserID(),
+				LabelResourceTier: string(tier),
+			},
+		},
+		Spec: PVCSpec{
+			AccessModes: []string{"ReadWriteOnce"},
+			Resources: ResourceRequirements{
+				Requests: map[string]string{
+					"storage": specs.EphemeralStorageLimit,
+				},
+			},
+		},
+	}
+	body, _ := json.Marshal(pvc)
+	postURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims", o.apiServerURL, o.manifestCfg.Namespace)
+	var created PVCManifest
+	if err := o.doJSON(ctx, http.MethodPost, postURL, bytes.NewReader(body), &created); err != nil {
+		return "", nil
+	}
+	return pvcName, nil
 }
 
 // WaitPodReady polls the Pod status until the Ready condition is True and a PodIP is assigned.

@@ -55,11 +55,15 @@ func TestProfileVault_SnapshotAndHydrateRoundTrip(t *testing.T) {
 			t.Fatalf("WriteFile: %v", err)
 		}
 	}
+	mustWrite(".ssh/id_ed25519", "PRIVATE_KEY_PERSISTED")
+	mustWrite(".ssh/id_ed25519.pub", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI orbit@acme.dev\n")
+	mustWrite(".gitconfig", "[user]\n\tname = Orbit\n")
+	mustWrite(".config/orbit/state.json", `{"configured_tools":["git"]}`)
 	mustWrite(".config/orbit-machine/settings.json", `{"theme":"catppuccin-mocha"}`)
 	mustWrite(".claude/CLAUDE.md", "# Claude Preferences\n")
 	mustWrite(".config/opencode/config.toml", "model = \"claude-sonnet\"\n")
 	mustWrite(".gemini/settings.json", `{"mcp":true}`)
-	mustWrite(".ssh/id_ed25519", "PRIVATE_KEY_NOT_WHITELISTED")
+	mustWrite(".cache/untracked.tmp", "NOT_WHITELISTED")
 
 	if err := vault.SnapshotProfile(ctx, mid, srcHome); err != nil {
 		t.Fatalf("SnapshotProfile: %v", err)
@@ -70,7 +74,7 @@ func TestProfileVault_SnapshotAndHydrateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
-	if bytes.Contains(rawBlob, []byte("catppuccin-mocha")) {
+	if bytes.Contains(rawBlob, []byte("catppuccin-mocha")) || bytes.Contains(rawBlob, []byte("PRIVATE_KEY_PERSISTED")) {
 		t.Fatalf("ciphertext leaked plaintext settings")
 	}
 
@@ -85,6 +89,10 @@ func TestProfileVault_SnapshotAndHydrateRoundTrip(t *testing.T) {
 	}
 
 	for rel, want := range map[string]string{
+		".ssh/id_ed25519":                     "PRIVATE_KEY_PERSISTED",
+		".ssh/id_ed25519.pub":                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI orbit@acme.dev\n",
+		".gitconfig":                          "[user]\n\tname = Orbit\n",
+		".config/orbit/state.json":            `{"configured_tools":["git"]}`,
 		".config/orbit-machine/settings.json": `{"theme":"catppuccin-mocha"}`,
 		".claude/CLAUDE.md":                   "# Claude Preferences\n",
 		".config/opencode/config.toml":        "model = \"claude-sonnet\"\n",
@@ -99,8 +107,8 @@ func TestProfileVault_SnapshotAndHydrateRoundTrip(t *testing.T) {
 		}
 	}
 
-	if _, err := os.Stat(filepath.Join(dstHome, ".ssh/id_ed25519")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected non-whitelisted .ssh/id_ed25519 to be excluded")
+	if _, err := os.Stat(filepath.Join(dstHome, ".cache/untracked.tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected non-whitelisted .cache/untracked.tmp to be excluded")
 	}
 
 	// 4. Cross-user AAD binding: another MachineID cannot decrypt mid's profile blob!

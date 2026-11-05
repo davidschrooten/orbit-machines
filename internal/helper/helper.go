@@ -194,7 +194,7 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// SaveContext writes context.json and env.sh under ~/.config/orbit.
+// SaveContext writes context.json and env.sh under ~/.config/orbit and mirrors context.json into <workDir>/.orbit.
 func (m *Manager) SaveContext(ctxData OrbitContext) error {
 	existing, _ := m.LoadContext()
 	ctxData.OrbitURL = fallbackStr(ctxData.OrbitURL, existing.OrbitURL)
@@ -211,14 +211,29 @@ func (m *Manager) SaveContext(ctxData OrbitContext) error {
 	if err := writeConfigFile(filepath.Join(m.configDir, "context.json"), raw, 0o600); err != nil {
 		return err
 	}
+	_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "context.json"), raw, 0o600)
 	return m.writeEnvSh(ctxData)
 }
 
-// LoadContext reads ~/.config/orbit/context.json and merges any ORBIT_* environment variables.
+// LoadContext reads ~/.config/orbit/context.json (falling back to <workDir>/.orbit/context.json) and merges any ORBIT_* environment variables.
 func (m *Manager) LoadContext() (OrbitContext, error) {
 	var out OrbitContext
 	if data, err := os.ReadFile(filepath.Join(m.configDir, "context.json")); err == nil {
 		_ = json.Unmarshal(data, &out)
+	}
+	if wsData, err := os.ReadFile(filepath.Join(m.workDir, ".orbit", "context.json")); err == nil {
+		var wsCtx OrbitContext
+		if json.Unmarshal(wsData, &wsCtx) == nil {
+			out.OrbitURL = fallbackStr(out.OrbitURL, wsCtx.OrbitURL)
+			out.OrbitMCPToken = fallbackStr(out.OrbitMCPToken, wsCtx.OrbitMCPToken)
+			out.WorkspaceID = fallbackStr(out.WorkspaceID, wsCtx.WorkspaceID)
+			out.WorkspaceSlug = fallbackStr(out.WorkspaceSlug, wsCtx.WorkspaceSlug)
+			out.UserID = fallbackStr(out.UserID, wsCtx.UserID)
+			out.UserEmail = fallbackStr(out.UserEmail, wsCtx.UserEmail)
+			if len(out.Repositories) == 0 {
+				out.Repositories = wsCtx.Repositories
+			}
+		}
 	}
 
 	out.OrbitURL = fallbackStr(out.OrbitURL, os.Getenv("ORBIT_URL"))
@@ -233,24 +248,59 @@ func (m *Manager) LoadContext() (OrbitContext, error) {
 	return out, nil
 }
 
-// LoadState reads ~/.config/orbit/state.json (falling back to helper-state.json).
+// LoadState reads ~/.config/orbit/state.json (falling back to helper-state.json and merging <workDir>/.orbit/state.json).
 func (m *Manager) LoadState() (State, error) {
 	var st State
 	if data, err := os.ReadFile(filepath.Join(m.configDir, "state.json")); err == nil {
 		_ = json.Unmarshal(data, &st)
-		return st, nil
-	}
-	if data, err := os.ReadFile(filepath.Join(m.configDir, "helper-state.json")); err == nil {
+	} else if data, err := os.ReadFile(filepath.Join(m.configDir, "helper-state.json")); err == nil {
 		_ = json.Unmarshal(data, &st)
+	}
+
+	if wsData, err := os.ReadFile(filepath.Join(m.workDir, ".orbit", "state.json")); err == nil {
+		var wsSt State
+		if json.Unmarshal(wsData, &wsSt) == nil {
+			st = mergeStates(st, wsSt)
+		}
 	}
 	return st, nil
 }
 
-// SaveState writes ~/.config/orbit/state.json and ~/.config/orbit/helper-state.json.
+func mergeStates(primary, secondary State) State {
+	out := primary
+	for _, r := range secondary.ClonedRepos {
+		out.ClonedRepos = appendUnique(out.ClonedRepos, r)
+	}
+	for _, r := range secondary.FlakeEnabledRepos {
+		out.FlakeEnabledRepos = appendUnique(out.FlakeEnabledRepos, r)
+	}
+	for _, t := range secondary.ConfiguredTools {
+		out.ConfiguredTools = appendUnique(out.ConfiguredTools, t)
+	}
+	if (out.SSHKey == nil || strings.TrimSpace(out.SSHKey.PrivateKey) == "") && secondary.SSHKey != nil && strings.TrimSpace(secondary.SSHKey.PrivateKey) != "" {
+		out.SSHKey = secondary.SSHKey
+	}
+	if out.Git == nil && secondary.Git != nil {
+		out.Git = secondary.Git
+	}
+	if secondary.UpdatedAt.After(out.UpdatedAt) {
+		out.UpdatedAt = secondary.UpdatedAt
+		if secondary.SSHKey != nil && strings.TrimSpace(secondary.SSHKey.PrivateKey) != "" {
+			out.SSHKey = secondary.SSHKey
+		}
+		if secondary.Git != nil {
+			out.Git = secondary.Git
+		}
+	}
+	return out
+}
+
+// SaveState writes ~/.config/orbit/state.json, ~/.config/orbit/helper-state.json, and <workDir>/.orbit/state.json.
 func (m *Manager) SaveState(st State) error {
 	st.UpdatedAt = time.Now().UTC()
 	raw, _ := json.MarshalIndent(st, "", "  ")
 	_ = writeConfigFile(filepath.Join(m.configDir, "helper-state.json"), raw, 0o600)
+	_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "state.json"), raw, 0o600)
 	return writeConfigFile(filepath.Join(m.configDir, "state.json"), raw, 0o600)
 }
 
@@ -278,18 +328,36 @@ func (m *Manager) ConfigureGit(name, email, defaultBranch string) error {
 		DefaultBranch: defaultBranch,
 	}
 	st.ConfiguredTools = appendUnique(st.ConfiguredTools, "git")
-	return m.SaveState(st)
+	if err := m.SaveState(st); err != nil {
+		return err
+	}
+	m.triggerSnapshot()
+	return nil
 }
 
 // EnsureGitAndSSH ensures ~/.gitconfig is initialized with SSH key rules (restoring from State.Git or Orbit user defaults)
-// and restores ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, and ~/.ssh/config if saved in State.SSHKey.
+// and restores ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, and ~/.ssh/config if saved in State.SSHKey or workspace backup.
 func (m *Manager) EnsureGitAndSSH() error {
 	st, _ := m.LoadState()
 	orbitCtx, _ := m.LoadContext()
+	stateChanged := false
+
+	if st.SSHKey == nil || strings.TrimSpace(st.SSHKey.PrivateKey) == "" {
+		if diskKey, ok := m.discoverSSHKeyFromDisk(); ok {
+			st.SSHKey = &diskKey
+			stateChanged = true
+		}
+	}
 
 	gitConfigPath := filepath.Join(m.homeDir, ".gitconfig")
 	existingGit, gitErr := os.ReadFile(gitConfigPath)
-	if gitErr != nil || !strings.Contains(string(existingGit), gitSSHMarker) {
+	needGitWrite := gitErr != nil || !strings.Contains(string(existingGit), gitSSHMarker)
+	if !needGitWrite && st.Git != nil && strings.TrimSpace(st.Git.UserName) != "" {
+		if !strings.Contains(string(existingGit), "name = "+strings.TrimSpace(st.Git.UserName)) {
+			needGitWrite = true
+		}
+	}
+	if needGitWrite {
 		name, email, branch := m.defaultGitIdentity(st, orbitCtx)
 		gitCfg := formatGitConfig(m.homeDir, name, email, branch)
 		if err := writeConfigFile(gitConfigPath, []byte(gitCfg), 0o644); err != nil {
@@ -301,16 +369,56 @@ func (m *Manager) EnsureGitAndSSH() error {
 				UserEmail:     email,
 				DefaultBranch: branch,
 			}
-			_ = m.SaveState(st)
+			stateChanged = true
 		}
 	}
 
 	if st.SSHKey != nil && strings.TrimSpace(st.SSHKey.PrivateKey) != "" {
+		if strings.TrimSpace(st.SSHKey.PublicKey) == "" {
+			if derived, err := deriveSSHPublicKey(st.SSHKey.PrivateKey); err == nil {
+				st.SSHKey.PublicKey = strings.TrimSpace(derived)
+				stateChanged = true
+			}
+		}
 		if err := m.writeSSHFiles(st.SSHKey.PrivateKey, st.SSHKey.PublicKey); err != nil {
 			return err
 		}
 	}
+
+	if _, err := os.Stat(filepath.Join(m.configDir, "state.json")); err != nil && (st.SSHKey != nil || st.Git != nil) {
+		stateChanged = true
+	}
+	if stateChanged {
+		_ = m.SaveState(st)
+	}
 	return nil
+}
+
+func (m *Manager) discoverSSHKeyFromDisk() (SSHKeyConfig, bool) {
+	candidates := []string{
+		filepath.Join(m.homeDir, ".ssh", "id_ed25519"),
+		filepath.Join(m.workDir, ".orbit", "ssh", "id_ed25519"),
+	}
+	for _, privPath := range candidates {
+		privBytes, err := os.ReadFile(privPath)
+		if err != nil || strings.TrimSpace(string(privBytes)) == "" {
+			continue
+		}
+		privPEM := strings.TrimSpace(string(privBytes)) + "\n"
+		pubAuth := ""
+		if pubBytes, pubErr := os.ReadFile(privPath + ".pub"); pubErr == nil && strings.TrimSpace(string(pubBytes)) != "" {
+			pubAuth = strings.TrimSpace(string(pubBytes))
+		} else if derived, derErr := deriveSSHPublicKey(privPEM); derErr == nil {
+			pubAuth = strings.TrimSpace(derived)
+		}
+		if pubAuth != "" {
+			return SSHKeyConfig{
+				PrivateKey: privPEM,
+				PublicKey:  pubAuth,
+			}, true
+		}
+	}
+	return SSHKeyConfig{}, false
 }
 
 // GenerateSSHKey generates a fresh Ed25519 SSH keypair in pure Go, writes ~/.ssh/id_ed25519,
@@ -339,6 +447,7 @@ func (m *Manager) GenerateSSHKey(comment string) (SSHKeyConfig, error) {
 	st.SSHKey = &cfg
 	_ = m.SaveState(st)
 	_ = m.EnsureGitAndSSH()
+	m.triggerSnapshot()
 	return cfg, nil
 }
 
@@ -370,6 +479,7 @@ func (m *Manager) SetSSHKey(privateKeyPEM string) (SSHKeyConfig, error) {
 	st.SSHKey = &cfg
 	_ = m.SaveState(st)
 	_ = m.EnsureGitAndSSH()
+	m.triggerSnapshot()
 	return cfg, nil
 }
 
@@ -381,6 +491,9 @@ func (m *Manager) PublicSSHKey() (string, error) {
 	}
 	st, _ := m.LoadState()
 	if st.SSHKey != nil && strings.TrimSpace(st.SSHKey.PublicKey) != "" {
+		if strings.TrimSpace(st.SSHKey.PrivateKey) != "" {
+			_ = m.writeSSHFiles(st.SSHKey.PrivateKey, st.SSHKey.PublicKey)
+		}
 		return strings.TrimSpace(st.SSHKey.PublicKey), nil
 	}
 	return "", fmt.Errorf("%w: no SSH key configured; run 'orbit ssh-key --generate'", domain.ErrInvalidConfig)
@@ -392,16 +505,21 @@ func (m *Manager) writeSSHFiles(privPEM, pubAuth string) error {
 		return fmt.Errorf("creating ~/.ssh: %w", err)
 	}
 	_ = os.Chmod(sshDir, 0o700)
+	privContent := []byte(strings.TrimSpace(privPEM) + "\n")
 	privPath := filepath.Join(sshDir, "id_ed25519")
-	if err := os.WriteFile(privPath, []byte(strings.TrimSpace(privPEM)+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(privPath, privContent, 0o600); err != nil {
 		return fmt.Errorf("writing id_ed25519: %w", err)
 	}
 	_ = os.Chmod(privPath, 0o600)
 	if strings.TrimSpace(pubAuth) != "" {
+		pubContent := []byte(strings.TrimSpace(pubAuth) + "\n")
 		pubPath := filepath.Join(sshDir, "id_ed25519.pub")
-		_ = os.WriteFile(pubPath, []byte(strings.TrimSpace(pubAuth)+"\n"), 0o644)
+		_ = os.WriteFile(pubPath, pubContent, 0o644)
 		_ = os.Chmod(pubPath, 0o644)
+		_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "ssh", "id_ed25519.pub"), pubContent, 0o644)
 	}
+	_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "ssh", "id_ed25519"), privContent, 0o600)
+
 	knownHostsPath := filepath.Join(sshDir, "known_hosts")
 	sshConfigPath := filepath.Join(sshDir, "config")
 	sshConfig := fmt.Sprintf("Host *\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s\n", privPath, knownHostsPath)
@@ -410,6 +528,20 @@ func (m *Manager) writeSSHFiles(privPEM, pubAuth string) error {
 	}
 	_ = os.Chmod(sshConfigPath, 0o600)
 	return nil
+}
+
+func (m *Manager) triggerSnapshot() {
+	if strings.TrimSpace(m.machinedURL) == "" || m.httpClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.machinedURL+"/api/v1/snapshot", nil)
+	if err == nil {
+		if resp, doErr := m.httpClient.Do(req); doErr == nil {
+			_ = resp.Body.Close()
+		}
+	}
 }
 
 func (m *Manager) defaultGitIdentity(st State, orbitCtx OrbitContext) (string, string, string) {
