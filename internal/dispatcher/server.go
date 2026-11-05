@@ -177,7 +177,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	clientConn.SetReadLimit(protocol.DefaultMaxPayloadBytes * 2)
+	clientConn.SetReadLimit(64 << 20)
 	defer func() { _ = clientConn.CloseNow() }()
 
 	sessCtx, sessCancel := context.WithCancel(r.Context())
@@ -191,10 +191,17 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		reposJSON string
 	)
 	if s.orbitClient != nil {
-		if creds, credErr := s.orbitClient.MintCredentials(sessCtx, protocol.MintCredentialsRequest{
+		creds, credErr := s.orbitClient.MintCredentials(sessCtx, protocol.MintCredentialsRequest{
 			WorkspaceID: mid.WorkspaceID(),
 			Subject:     mid.UserID(),
-		}); credErr == nil {
+		})
+		if credErr != nil && strings.TrimSpace(claims.UserLogin) != "" && claims.UserLogin != mid.UserID() {
+			creds, credErr = s.orbitClient.MintCredentials(sessCtx, protocol.MintCredentialsRequest{
+				WorkspaceID: mid.WorkspaceID(),
+				Subject:     strings.TrimSpace(claims.UserLogin),
+			})
+		}
+		if credErr == nil {
 			mcpToken = creds.OrbitMCPToken
 			repos = creds.Repositories
 			if len(repos) > 0 {
@@ -243,7 +250,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		_ = clientConn.Close(websocket.StatusBadGateway, "unable to dial pod websocket")
 		return
 	}
-	podConn.SetReadLimit(protocol.DefaultMaxPayloadBytes * 2)
+	podConn.SetReadLimit(64 << 20)
 	defer func() { _ = podConn.CloseNow() }()
 
 	_ = spliceWebSockets(sessCtx, clientConn, podConn)

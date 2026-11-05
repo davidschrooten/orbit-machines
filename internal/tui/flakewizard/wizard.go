@@ -20,9 +20,11 @@ import (
 // for instant fuzzy search inside the Flake Init Wizard.
 var DefaultCatalog = []string{
 	"git",
+	"htop",
+	"curl",
+	"wget",
 	"ripgrep",
 	"jq",
-	"curl",
 	"fd",
 	"lazygit",
 	"gh",
@@ -43,12 +45,35 @@ var DefaultCatalog = []string{
 	"kubernetes-helm",
 }
 
+// BasePackages are always included in generated Orbit devshells.
+var BasePackages = []string{
+	"git",
+	"htop",
+	"curl",
+	"wget",
+	"ripgrep",
+	"jq",
+}
+
 var stackRecommendedPackages = map[string][]string{
-	"go":     {"go", "golangci-lint"},
-	"nodejs": {"nodejs_22"},
-	"ruby":   {"ruby_4_0", "bundler"},
-	"rust":   {"rustup"},
-	"python": {"python313", "uv"},
+	"go":     {"go", "golangci-lint", "htop", "curl", "wget", "git"},
+	"nodejs": {"nodejs_22", "htop", "curl", "wget", "git"},
+	"node":   {"nodejs_22", "htop", "curl", "wget", "git"},
+	"ruby":   {"ruby_4_0", "bundler", "htop", "curl", "wget", "git"},
+	"rust":   {"rustup", "htop", "curl", "wget", "git"},
+	"python": {"python313", "uv", "htop", "curl", "wget", "git"},
+}
+
+// StackPackages returns the recommended Nixpkgs packages for a named stack
+// (including base utilities htop, curl, wget, git).
+func StackPackages(stack string) []string {
+	key := strings.ToLower(strings.TrimSpace(stack))
+	if pkgs, ok := stackRecommendedPackages[key]; ok {
+		out := make([]string, len(pkgs))
+		copy(out, pkgs)
+		return out
+	}
+	return nil
 }
 
 // PackageSearcher queries Nixpkgs for additional package attributes matching query.
@@ -94,11 +119,9 @@ func New(cfg Config) (*Wizard, error) {
 	}
 
 	stacks, _ := nixenv.DetectStacks(dir)
-	selected := map[string]bool{
-		"git":     true,
-		"ripgrep": true,
-		"jq":      true,
-		"curl":    true,
+	selected := make(map[string]bool, len(BasePackages))
+	for _, pkg := range BasePackages {
+		selected[pkg] = true
 	}
 	catalogSet := make(map[string]bool, len(DefaultCatalog))
 	for _, pkg := range DefaultCatalog {

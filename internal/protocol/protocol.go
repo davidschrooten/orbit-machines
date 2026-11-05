@@ -13,9 +13,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// DefaultMaxPayloadBytes is the default upper bound (4 MiB) on uncompressed or
+// DefaultMaxPayloadBytes is the default upper bound (64 MiB) on uncompressed or
 // wire WebSocket payloads.
-const DefaultMaxPayloadBytes = 4 << 20
+const DefaultMaxPayloadBytes = 64 << 20
 
 // Protocol-specific errors.
 var (
@@ -26,16 +26,18 @@ var (
 // FrameType is the 1-byte header prefix on every binary WebSocket message.
 type FrameType byte
 
-// Binary WebSocket frame type headers for client-to-server (0x01-0x03) and server-to-client (0x10-0x13) messages.
+// Binary WebSocket frame type headers for client-to-server (0x01-0x04) and server-to-client (0x10-0x13) messages.
 const (
-	FrameInput  FrameType = 0x01
-	FrameResize FrameType = 0x02
-	FramePing   FrameType = 0x03
+	FrameInput      FrameType = 0x01
+	FrameResize     FrameType = 0x02
+	FramePing       FrameType = 0x03
+	FrameFileUpload FrameType = 0x04
 
-	FrameSnapshot FrameType = 0x10
-	FrameDiff     FrameType = 0x11
-	FramePong     FrameType = 0x12
-	FrameMetadata FrameType = 0x13
+	FrameSnapshot   FrameType = 0x10
+	FrameDiff       FrameType = 0x11
+	FrameOutputDiff FrameType = FrameDiff
+	FramePong       FrameType = 0x12
+	FrameMetadata   FrameType = 0x13
 )
 
 // MetadataEventType classifies out-of-band 0x13 metadata events.
@@ -185,10 +187,10 @@ func (c *FrameCodec) Decode(raw []byte) (DecodedFrame, error) {
 
 	ft := FrameType(raw[0])
 	switch ft {
-	case FrameInput:
+	case FrameInput, FrameFileUpload:
 		buf := make([]byte, len(payload))
 		copy(buf, payload)
-		return DecodedFrame{Type: FrameInput, Data: buf}, nil
+		return DecodedFrame{Type: ft, Data: buf}, nil
 
 	case FrameResize:
 		if len(payload) != 4 {

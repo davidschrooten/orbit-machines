@@ -11,9 +11,12 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/shellinit"
 )
 
-func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T) {
+func TestEnsureInitialized_WritesStarshipJetpackDirenvAndWelcomeBashrc(t *testing.T) {
 	t.Parallel()
 
+	if err := shellinit.EnsureConfig(""); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty homeDir in EnsureConfig, got %v", err)
+	}
 	if err := shellinit.EnsureInitialized("", "/tmp/ws"); !errors.Is(err, domain.ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for empty homeDir, got %v", err)
 	}
@@ -24,8 +27,8 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 	homeDir := filepath.Join(t.TempDir(), "orbit-home")
 	workDir := filepath.Join(homeDir, "workspace")
 
-	if err := shellinit.EnsureInitialized(homeDir, workDir); err != nil {
-		t.Fatalf("EnsureInitialized: %v", err)
+	if err := shellinit.EnsureConfig(homeDir); err != nil {
+		t.Fatalf("EnsureConfig: %v", err)
 	}
 
 	// Verify directories created
@@ -41,7 +44,7 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 		}
 	}
 
-	// Verify starship.toml contains Tokyo Night preset with Orbit logo (🪐)
+	// Verify starship.toml contains Jetpack preset
 	starshipPath := filepath.Join(homeDir, ".config", "starship.toml")
 	starshipBytes, err := os.ReadFile(starshipPath)
 	if err != nil {
@@ -49,16 +52,32 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 	}
 	starshipStr := string(starshipBytes)
 	for _, needle := range []string{
-		"[░▒▓](#a3aed2)",
-		"[ 🪐 ](bg:#a3aed2 fg:#090c0c)",
-		"$directory",
-		"$git_branch",
-		"$nix_shell",
-		"[time]",
+		"# orbit-preset: jetpack",
+		`continuation_prompt = "[▸▹ ](dimmed white)"`,
+		"right_format =",
+		"[character]",
+		"[username]",
+		"[directory]",
+		"[git_branch]",
+		"[git_metrics]",
+		"[git_status]",
+		"[nix_shell]",
 	} {
 		if !strings.Contains(starshipStr, needle) {
 			t.Errorf("starship.toml missing %q", needle)
 		}
+	}
+
+	// Verify legacy starship.toml without `# orbit-preset: jetpack` gets upgraded automatically
+	if err := os.WriteFile(starshipPath, []byte("# old tokyo night config\nformat = \"$all\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile legacy starship: %v", err)
+	}
+	if err := shellinit.EnsureInitialized(homeDir, workDir); err != nil {
+		t.Fatalf("EnsureInitialized upgrade: %v", err)
+	}
+	upgradedBytes, _ := os.ReadFile(starshipPath)
+	if !strings.Contains(string(upgradedBytes), "# orbit-preset: jetpack") {
+		t.Fatalf("expected legacy starship.toml to be upgraded to jetpack preset")
 	}
 
 	// Verify direnv.toml whitelists /home/orbit/workspace and workDir
@@ -72,7 +91,7 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 		t.Errorf("unexpected direnv.toml:\n%s", direnvStr)
 	}
 
-	// Verify .bashrc and .bash_profile contain direnv hook, starship init, and env.sh sourcing
+	// Verify .bashrc and .bash_profile contain direnv hook, starship init, env.sh sourcing, and welcome banner
 	bashrcPath := filepath.Join(homeDir, ".bashrc")
 	bashrcBytes, err := os.ReadFile(bashrcPath)
 	if err != nil {
@@ -84,6 +103,14 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 		`eval "$(direnv hook bash)"`,
 		`eval "$(starship init bash)"`,
 		"STARSHIP_CONFIG",
+		"if [[ $- == *i* ]]; then",
+		"Welcome to Orbit Machine",
+		"orbit repos",
+		"orbit flake init [stack]",
+		"orbit tools [tool...]",
+		"orbit git",
+		"orbit ssh-key",
+		"orbit status",
 	} {
 		if !strings.Contains(bashrcStr, needle) {
 			t.Errorf(".bashrc missing %q", needle)
@@ -99,24 +126,36 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 		t.Errorf(".bash_profile does not source .bashrc:\n%s", string(profileBytes))
 	}
 
-	// Calling EnsureInitialized a second time is idempotent and preserves custom starship.toml edits
+	// Calling EnsureInitialized a second time preserves custom starship.toml edits when # orbit-preset: jetpack is present
 	customStarship := "# user custom starship\n" + starshipStr
 	if err := os.WriteFile(starshipPath, []byte(customStarship), 0o644); err != nil {
 		t.Fatalf("WriteFile custom starship: %v", err)
 	}
+	// Also test replacing an older shellinit block in .bashrc in-place
+	oldBashrc := "alias ll='ls -la'\n# >>> orbit-machines shellinit >>>\nold block\n# <<< orbit-machines shellinit <<<\nexport AFTER=1\n"
+	if err := os.WriteFile(bashrcPath, []byte(oldBashrc), 0o644); err != nil {
+		t.Fatalf("WriteFile old .bashrc: %v", err)
+	}
 	if err := shellinit.EnsureInitialized(homeDir, workDir); err != nil {
 		t.Fatalf("second EnsureInitialized: %v", err)
 	}
+	// Run once more with standard markers already present to verify in-place replacement of standard markers too
+	if err := shellinit.EnsureInitialized(homeDir, workDir); err != nil {
+		t.Fatalf("third EnsureInitialized: %v", err)
+	}
 	afterStarship, _ := os.ReadFile(starshipPath)
 	if string(afterStarship) != customStarship {
-		t.Fatalf("expected existing starship.toml to be preserved")
+		t.Fatalf("expected existing jetpack starship.toml to be preserved")
 	}
 	afterBashrc, _ := os.ReadFile(bashrcPath)
 	if strings.Count(string(afterBashrc), ">>> orbit-machines shell init >>>") != 1 {
 		t.Fatalf("expected .bashrc init block to appear exactly once, got:\n%s", string(afterBashrc))
 	}
+	if !strings.Contains(string(afterBashrc), "Welcome to Orbit Machine") || !strings.Contains(string(afterBashrc), "export AFTER=1") {
+		t.Fatalf("expected old .bashrc block to be replaced in-place preserving surrounding lines, got:\n%s", string(afterBashrc))
+	}
 
-	// Test pre-existing .bashrc without trailing newline and default /home/orbit/workspace direnv whitelist
+	// Test pre-existing .bashrc without trailing newline
 	homeDir2 := filepath.Join(t.TempDir(), "home2")
 	_ = os.MkdirAll(homeDir2, 0o755)
 	_ = os.WriteFile(filepath.Join(homeDir2, ".bashrc"), []byte("alias ll='ls -la'"), 0o644)
@@ -128,11 +167,20 @@ func TestEnsureInitialized_WritesStarshipTokyoNightDirenvAndBashrc(t *testing.T)
 		t.Fatalf("unexpected merged .bashrc:\n%s", string(b2))
 	}
 
-	// Test filesystem error when homeDir is a file instead of a directory
+	// Test filesystem error when homeDir is a file instead of a directory, or starship.toml is a directory
 	blockingFile := filepath.Join(t.TempDir(), "file-not-dir")
 	_ = os.WriteFile(blockingFile, []byte("x"), 0o644)
 	if err := shellinit.EnsureInitialized(blockingFile, filepath.Join(blockingFile, "ws")); err == nil {
 		t.Fatalf("expected error when homeDir is an existing regular file")
 	}
+	homeDir3 := filepath.Join(t.TempDir(), "home3")
+	_ = os.MkdirAll(filepath.Join(homeDir3, ".config", "starship.toml"), 0o755)
+	if err := shellinit.EnsureInitialized(homeDir3, filepath.Join(homeDir3, "ws")); err == nil {
+		t.Fatalf("expected error when starship.toml is a directory")
+	}
+	homeDir4 := filepath.Join(t.TempDir(), "home4")
+	_ = os.MkdirAll(filepath.Join(homeDir4, ".bashrc"), 0o755)
+	if err := shellinit.EnsureInitialized(homeDir4, filepath.Join(homeDir4, "ws")); err == nil {
+		t.Fatalf("expected error when .bashrc is a directory")
+	}
 }
-

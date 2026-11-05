@@ -138,10 +138,12 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 					_, _ = mgr.ConfigureTools(helper.SupportedTools)
 				}
 			}
+			_ = mgr.EnsureGitAndSSH()
 			_, _ = mgr.AutoloadAllWorkspaceFlakes(ctx)
 		}
 
 		wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+			WorkspaceDir: cfg.WorkDir,
 			ShellSpawner: func(spawnCtx context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 				return spawnShellPane(spawnCtx, homeDir, cfg.WorkDir, tabID, "Starship Shell ("+tabID+")", cols, rows), nil
 			},
@@ -208,6 +210,7 @@ func applyContextUpdate(mgr *helper.Manager, req tui.ContextUpdateRequest) error
 	if req.OrbitMCPToken != "" {
 		_, _ = mgr.ConfigureTools(helper.SupportedTools)
 	}
+	_ = mgr.EnsureGitAndSSH()
 	return nil
 }
 

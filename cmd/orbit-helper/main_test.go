@@ -76,9 +76,62 @@ func TestOrbitHelperCLI_Subcommands(t *testing.T) {
 		t.Fatalf("flake autoload --dir failed: code=%d err=%q", code, errOut)
 	}
 
-	// 5. tools --select claude,agy,opencode,gh,git
+	// 5. tools --select claude,agy,opencode,gh,git and positional tools
 	if code, out, errOut := execCLI("", "tools", "--select", "claude,agy,opencode,gh,git"); code != 0 || !strings.Contains(out, "claude") {
 		t.Fatalf("tools --select failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "tools", "claude", "gemini", "codex", "cursor", "aider"); code != 0 || !strings.Contains(out, "gemini") {
+		t.Fatalf("tools positional failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// 5b. init, git (flags & interactive), and ssh-key (--show, --generate, --set, --import, interactive)
+	if code, out, errOut := execCLI("", "init"); code != 0 || !strings.Contains(out, "Initialized") {
+		t.Fatalf("init failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("", "git", "--name", "CLI User", "--email", "cli@acme.dev", "--branch", "main"); code != 0 || !strings.Contains(out, "CLI User") {
+		t.Fatalf("git flags failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("Interactive User\ninter@acme.dev\nmain\n", "git"); code != 0 || !strings.Contains(out, "Interactive User") {
+		t.Fatalf("git interactive failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, _ := execCLI("", "ssh-key", "--show"); code != 0 || !strings.Contains(out, "No SSH public key") {
+		t.Fatalf("ssh-key --show (empty) failed: code=%d out=%q", code, out)
+	}
+	if code, out, errOut := execCLI("", "ssh-key", "--generate", "--comment", "cli@acme.dev"); code != 0 || !strings.Contains(out, "ssh-ed25519") {
+		t.Fatalf("ssh-key --generate failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, _ := execCLI("", "ssh-key", "--show"); code != 0 || !strings.Contains(out, "ssh-ed25519") {
+		t.Fatalf("ssh-key --show (after generate) failed: code=%d out=%q", code, out)
+	}
+	st, _ := mgr.LoadState()
+	if code, out, errOut := execCLI("", "ssh-key", "--set", st.SSHKey.PrivateKey); code != 0 || !strings.Contains(out, "Imported SSH key") {
+		t.Fatalf("ssh-key --set failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	keyFile := filepath.Join(t.TempDir(), "import_key")
+	_ = os.WriteFile(keyFile, []byte(st.SSHKey.PrivateKey), 0o600)
+	if code, out, errOut := execCLI("", "ssh-key", "--import", keyFile); code != 0 || !strings.Contains(out, "Imported SSH key") {
+		t.Fatalf("ssh-key --import file failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI(st.SSHKey.PrivateKey, "ssh-key", "--import", "-"); code != 0 || !strings.Contains(out, "Imported SSH key") {
+		t.Fatalf("ssh-key --import stdin failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := execCLI("3\n", "ssh-key"); code != 0 || !strings.Contains(out, "ssh-ed25519") {
+		t.Fatalf("ssh-key interactive show failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, _, _ := execCLI("", "flake", "go", "--dir", customDir); code != 0 {
+		t.Fatalf("flake go shorthand failed: code=%d", code)
+	}
+	if code, _, _ := execCLI("", "flake", "init", "go", "--dir", customDir); code != 0 {
+		t.Fatalf("flake init go failed: code=%d", code)
+	}
+	if code, _, _ := execCLI("", "ssh-key", "--import", "/nonexistent/key/path"); code != 1 {
+		t.Fatalf("expected exit code 1 on missing ssh-key import file, got %d", code)
+	}
+	if code, _, _ := execCLI("", "ssh-key", "--set", "invalid-pem"); code != 1 {
+		t.Fatalf("expected exit code 1 on invalid ssh-key --set, got %d", code)
+	}
+	if code, _, _ := execCLI("", "git", "--name", "OnlyName"); code != 1 {
+		t.Fatalf("expected exit code 1 when git --email is missing, got %d", code)
 	}
 
 	// 6. status & save

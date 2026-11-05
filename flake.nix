@@ -51,7 +51,9 @@
             pkgs.golangci-lint
             pkgs.gnumake
             pkgs.git
+            pkgs.htop
             pkgs.curl
+            pkgs.wget
             pkgs.jq
             pkgs.ripgrep
             pkgs.kubectl

@@ -62,10 +62,13 @@ func TestWizard_AutoDetectSearchToggleAIGenerateAndActivate(t *testing.T) {
 		}
 		return false
 	}
-	for _, expected := range []string{"go", "golangci-lint", "nodejs_22", "ruby_4_0", "bundler", "rustup", "python313", "uv"} {
+	for _, expected := range []string{"git", "htop", "curl", "wget", "go", "golangci-lint", "nodejs_22", "ruby_4_0", "bundler", "rustup", "python313", "uv"} {
 		if !hasPkg(selected, expected) {
 			t.Fatalf("expected auto-detected %q in SelectedPackages(), got %v", expected, selected)
 		}
+	}
+	if len(flakewizard.StackPackages("go")) == 0 || flakewizard.StackPackages("unknown") != nil {
+		t.Fatalf("unexpected StackPackages result")
 	}
 
 	// 2. Search catalog + custom Searcher and toggle packages with cursor.

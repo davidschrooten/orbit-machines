@@ -140,6 +140,7 @@ type FakeClient struct {
 	Registrations     []protocol.RegisterClusterRequest
 	CredentialMints   []protocol.MintCredentialsRequest
 	RevokeOnHeartbeat []string
+	FailSubject       string
 }
 
 // NewFakeClient creates a new in-memory FakeClient.
@@ -178,6 +179,9 @@ func (f *FakeClient) MintCredentials(_ context.Context, req protocol.MintCredent
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.CredentialMints = append(f.CredentialMints, req)
+	if f.FailSubject != "" && req.Subject == f.FailSubject {
+		return protocol.MintCredentialsResponse{}, errors.New("subject not found")
+	}
 	return protocol.MintCredentialsResponse{
 		OrbitMCPToken: "omcp_fake_token",
 		Repositories: []protocol.RepoCredential{

@@ -1,0 +1,35 @@
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/orbit-machined ./cmd/orbit-machined && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/orbit-helper ./cmd/orbit-helper
+
+FROM alpine:3.21
+RUN apk add --no-cache \
+    ca-certificates \
+    bash \
+    starship \
+    direnv \
+    git \
+    github-cli \
+    htop \
+    curl \
+    wget \
+    jq \
+    ripgrep \
+    openssh-client \
+    ncurses-terminfo-base && \
+    addgroup -g 1000 orbit && \
+    adduser -D -u 1000 -G orbit -h /home/orbit -s /bin/bash orbit && \
+    mkdir -p /home/orbit/workspace /nix && \
+    chown -R 1000:1000 /home/orbit /nix
+
+COPY --from=builder /out/orbit-machined /usr/local/bin/orbit-machined
+COPY --from=builder /out/orbit-helper /usr/local/bin/orbit-helper
+RUN ln -sf /usr/local/bin/orbit-helper /usr/local/bin/orbit
+
+USER 1000:1000
+WORKDIR /home/orbit/workspace
+ENTRYPOINT ["/usr/local/bin/orbit-machined"]
