@@ -123,6 +123,10 @@ spec:
               drop:
                 - ALL
           env:
+            - name: HOME
+              value: "/tmp"
+            - name: MC_CONFIG_DIR
+              value: "/tmp/.mc"
             - name: MINIO_ENDPOINT
               value: {{ include "orbit-machines.s3Endpoint" . | quote }}
             - name: MINIO_ACCESS_KEY
