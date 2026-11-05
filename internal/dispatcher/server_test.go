@@ -85,6 +85,7 @@ func TestServer_WebSocketTerminalBootAndSplice(t *testing.T) {
 	}
 
 	srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
+		OrbitURL:          "https://orbit.acme.dev",
 		ClusterToken:      testClusterToken,
 		MaxConcurrentPods: 10,
 		TicketCodec:       ticketCodec,
@@ -139,7 +140,7 @@ func TestServer_WebSocketTerminalBootAndSplice(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	wsURL := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + signedTicket
+	wsURL := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + signedTicket + "&tab=tab-2"
 	clientConn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
 	if err != nil {
 		t.Fatalf("websocket.Dial gateway: %v", err)

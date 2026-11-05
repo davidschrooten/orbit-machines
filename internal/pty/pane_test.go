@@ -148,4 +148,28 @@ func TestVirtualPane_DeterministicEmulationAndDirtyTracking(t *testing.T) {
 	if err := vp.Resize(0, -1); !errors.Is(err, domain.ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig on non-positive Resize, got %v", err)
 	}
+
+	// Scrollback and SetOnOutput streaming
+	var streamed []byte
+	vp.SetOnOutput(func(chunk []byte) {
+		streamed = append(streamed, chunk...)
+	})
+	vp.FeedOutput(nil) // empty chunk is no-op
+	vp.FeedOutput([]byte("stream-test-123"))
+	if string(streamed) != "stream-test-123" {
+		t.Fatalf("streamed = %q, want stream-test-123", string(streamed))
+	}
+	if !strings.Contains(string(vp.Scrollback()), "stream-test-123") {
+		t.Fatalf("Scrollback missing stream-test-123")
+	}
+
+	// Verify scrollback ring buffer caps at MaxScrollbackBytes
+	bigChunk := make([]byte, pty.MaxScrollbackBytes+1024)
+	for i := range bigChunk {
+		bigChunk[i] = 'Z'
+	}
+	vp.FeedOutput(bigChunk)
+	if len(vp.Scrollback()) != pty.MaxScrollbackBytes {
+		t.Fatalf("Scrollback len = %d, want %d", len(vp.Scrollback()), pty.MaxScrollbackBytes)
+	}
 }

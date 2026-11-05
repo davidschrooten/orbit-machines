@@ -11,13 +11,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
 	"github.com/davidschrooten/orbit-machines/internal/domain"
+	"github.com/davidschrooten/orbit-machines/internal/helper"
 	"github.com/davidschrooten/orbit-machines/internal/pty"
 	"github.com/davidschrooten/orbit-machines/internal/tui"
 	"github.com/spf13/cobra"
@@ -120,19 +123,36 @@ func collectStorePaths(args []string, envOutPaths string) []string {
 func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedConfig) error {
 	return func(ctx context.Context, cfg config.MachinedConfig) error {
 		logger := slog.New(slog.NewJSONHandler(logOut, nil))
-		comp := tui.NewCompositor(tui.CompositorConfig{
-			WorkspaceSlug: cfg.MachineID.WorkspaceID(),
-			ResourceTier:  string(cfg.ResourceTier),
-			SpawnPane: func(id, title string, cols, rows int) *pty.Pane {
-				return spawnShellPane(ctx, cfg.WorkDir, id, title, cols, rows)
+		homeDir := resolveHomeDir(cfg.WorkDir)
+
+		mgr, _ := helper.NewManager(helper.Config{
+			HomeDir: homeDir,
+			WorkDir: cfg.WorkDir,
+		})
+		if mgr != nil {
+			if initCtx, err := mgr.LoadContext(); err == nil {
+				initCtx.WorkspaceID = cfg.MachineID.WorkspaceID()
+				initCtx.UserID = cfg.MachineID.UserID()
+				_ = mgr.SaveContext(initCtx)
+				if initCtx.OrbitMCPToken != "" {
+					_, _ = mgr.ConfigureTools(helper.SupportedTools)
+				}
+			}
+			_, _ = mgr.AutoloadAllWorkspaceFlakes(ctx)
+		}
+
+		wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+			ShellSpawner: func(spawnCtx context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
+				return spawnShellPane(spawnCtx, homeDir, cfg.WorkDir, tabID, "Starship Shell ("+tabID+")", cols, rows), nil
+			},
+			OnContextUpdate: func(req tui.ContextUpdateRequest) error {
+				return applyContextUpdate(mgr, req)
 			},
 		})
-		defer func() { _ = comp.Close() }()
-
-		wsSrv, err := tui.NewWSServer(tui.WSServerConfig{Compositor: comp})
 		if err != nil {
 			return err
 		}
+		defer func() { _ = wsSrv.Close() }()
 
 		ln, err := net.Listen("tcp", cfg.ListenAddr)
 		if err != nil {
@@ -170,25 +190,71 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 	}
 }
 
-func spawnShellPane(ctx context.Context, workDir, id, title string, cols, rows int) *pty.Pane {
+func applyContextUpdate(mgr *helper.Manager, req tui.ContextUpdateRequest) error {
+	if mgr == nil {
+		return nil
+	}
+	if err := mgr.SaveContext(helper.OrbitContext{
+		OrbitURL:      req.OrbitURL,
+		OrbitMCPToken: req.OrbitMCPToken,
+		WorkspaceID:   req.WorkspaceID,
+		WorkspaceSlug: req.WorkspaceSlug,
+		UserID:        req.UserID,
+		UserEmail:     req.UserEmail,
+		Repositories:  req.Repositories,
+	}); err != nil {
+		return err
+	}
+	if req.OrbitMCPToken != "" {
+		_, _ = mgr.ConfigureTools(helper.SupportedTools)
+	}
+	return nil
+}
+
+func resolveHomeDir(workDir string) string {
+	if envHome := strings.TrimSpace(os.Getenv("ORBIT_MACHINED_HOME_DIR")); envHome != "" {
+		return envHome
+	}
+	parent := filepath.Dir(strings.TrimSpace(workDir))
+	if parent != "" && parent != "." && parent != "/" {
+		return parent
+	}
+	if envHome := strings.TrimSpace(os.Getenv("HOME")); envHome != "" {
+		return envHome
+	}
+	return "/home/orbit"
+}
+
+func spawnShellPane(ctx context.Context, homeDir, workDir, id, title string, cols, rows int) *pty.Pane {
 	shell := strings.TrimSpace(os.Getenv("SHELL"))
 	if shell == "" {
-		if _, err := os.Stat("/bin/bash"); err == nil {
-			shell = "/bin/bash"
+		if path, err := exec.LookPath("bash"); err == nil {
+			shell = path
 		} else {
 			shell = "/bin/sh"
 		}
+	}
+	cmdArgs := []string{shell}
+	if strings.HasSuffix(shell, "bash") {
+		cmdArgs = []string{shell, "-l"}
 	}
 	dir := workDir
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		dir = os.TempDir()
 	}
+	env := append(os.Environ(),
+		"HOME="+homeDir,
+		"STARSHIP_CONFIG="+filepath.Join(homeDir, ".config", "starship.toml"),
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"ORBIT_TAB_ID="+id,
+	)
 	pane, err := pty.Spawn(ctx, pty.PaneConfig{
 		ID:      id,
 		Title:   title,
-		Command: []string{shell},
+		Command: cmdArgs,
 		Dir:     dir,
-		Env:     append(os.Environ(), "TERM=xterm-256color"),
+		Env:     env,
 		Cols:    cols,
 		Rows:    rows,
 	})

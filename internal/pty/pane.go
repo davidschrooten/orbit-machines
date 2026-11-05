@@ -17,15 +17,20 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/domain"
 )
 
+// MaxScrollbackBytes is the maximum number of raw output bytes retained per Pane
+// for instant tab snapshot replay upon WebSocket reconnect.
+const MaxScrollbackBytes = 64 * 1024
+
 // PaneConfig configures a child PTY process and its virtual terminal buffer.
 type PaneConfig struct {
-	ID      string
-	Title   string
-	Command []string
-	Dir     string
-	Env     []string
-	Cols    int
-	Rows    int
+	ID       string
+	Title    string
+	Command  []string
+	Dir      string
+	Env      []string
+	Cols     int
+	Rows     int
+	OnOutput func(chunk []byte)
 }
 
 // Pane couples a child PTY (or headless virtual buffer) with a VT emulator.
@@ -33,14 +38,16 @@ type Pane struct {
 	id    string
 	title string
 
-	mu       sync.Mutex
-	emulator *vt.Emulator
-	cols     int
-	rows     int
-	ptmx     *os.File
-	cmd      *exec.Cmd
-	recInput bytes.Buffer
-	closed   bool
+	mu         sync.Mutex
+	emulator   *vt.Emulator
+	cols       int
+	rows       int
+	ptmx       *os.File
+	cmd        *exec.Cmd
+	recInput   bytes.Buffer
+	scrollback []byte
+	onOutput   func(chunk []byte)
+	closed     bool
 
 	dirty  atomic.Bool
 	exited atomic.Bool
@@ -86,6 +93,7 @@ func Spawn(ctx context.Context, cfg PaneConfig) (*Pane, error) {
 		rows:     rows,
 		ptmx:     ptmx,
 		cmd:      cmd,
+		onOutput: cfg.OnOutput,
 	}
 	p.dirty.Store(true)
 
@@ -144,12 +152,51 @@ func (p *Pane) RecordedInput() []byte {
 	return out
 }
 
-// FeedOutput writes raw ANSI output directly into the VT emulator and marks the pane dirty.
+// FeedOutput writes raw ANSI output directly into the VT emulator, appends to
+// scrollback, marks the pane dirty, and notifies any registered output listener.
 func (p *Pane) FeedOutput(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	chunk := make([]byte, len(data))
+	copy(chunk, data)
+
 	p.mu.Lock()
-	_, _ = p.emulator.Write(data)
+	_, _ = p.emulator.Write(chunk)
+	p.appendScrollbackLocked(chunk)
+	cb := p.onOutput
 	p.mu.Unlock()
+
 	p.dirty.Store(true)
+	if cb != nil {
+		cb(chunk)
+	}
+}
+
+// SetOnOutput registers a callback invoked with every raw output chunk produced by the pane.
+func (p *Pane) SetOnOutput(fn func(chunk []byte)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onOutput = fn
+}
+
+// Scrollback returns a copy of the most recent raw output bytes (up to MaxScrollbackBytes).
+func (p *Pane) Scrollback() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]byte, len(p.scrollback))
+	copy(out, p.scrollback)
+	return out
+}
+
+func (p *Pane) appendScrollbackLocked(chunk []byte) {
+	p.scrollback = append(p.scrollback, chunk...)
+	if len(p.scrollback) > MaxScrollbackBytes {
+		excess := len(p.scrollback) - MaxScrollbackBytes
+		trimmed := make([]byte, MaxScrollbackBytes)
+		copy(trimmed, p.scrollback[excess:])
+		p.scrollback = trimmed
+	}
 }
 
 // Resize updates both the VT emulator dimensions and the OS PTY window size (TIOCSWINSZ).
@@ -226,10 +273,7 @@ func (p *Pane) readLoop() {
 	for {
 		n, err := p.ptmx.Read(buf)
 		if n > 0 {
-			p.mu.Lock()
-			_, _ = p.emulator.Write(buf[:n])
-			p.mu.Unlock()
-			p.dirty.Store(true)
+			p.FeedOutput(buf[:n])
 		}
 		if err != nil {
 			return
