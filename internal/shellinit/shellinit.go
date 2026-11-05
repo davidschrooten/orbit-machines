@@ -361,6 +361,46 @@ format = " spack [$symbol$environment]($style)"
 // TokyoNightStarshipTOML is a deprecated alias for JetpackStarshipTOML.
 const TokyoNightStarshipTOML = JetpackStarshipTOML
 
+// DefaultConfigurationNix is the default declarative Nix package environment
+// written to ~/.config/orbit/configuration.nix and persisted across Pod restarts.
+const DefaultConfigurationNix = `{ pkgs ? import <nixpkgs> {} }:
+
+pkgs.buildEnv {
+  name = "orbit-machine-env";
+  paths = with pkgs; [
+    nix
+    bashInteractive
+    coreutils
+    findutils
+    gnugrep
+    gnused
+    gawk
+    gnutar
+    gzip
+    xz
+    zstd
+    which
+    procps
+    less
+    ncurses
+    cacert
+    openssl
+    pkg-config
+    git
+    gh
+    openssh
+    htop
+    curl
+    wget
+    jq
+    ripgrep
+    starship
+    direnv
+    nix-direnv
+  ];
+}
+`
+
 // EnsureConfig initializes Orbit Machine shell configuration under homeDir using
 // <homeDir>/workspace as the default workspace directory.
 func EnsureConfig(homeDir string) error {
@@ -388,12 +428,32 @@ func EnsureInitialized(homeDir, workDir string) error {
 	dirs := []string{
 		filepath.Join(homeDir, ".config"),
 		filepath.Join(homeDir, ".config", "direnv"),
+		filepath.Join(homeDir, ".config", "nix"),
 		filepath.Join(homeDir, ".config", "orbit"),
 		workDir,
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("creating directory %s: %w", dir, err)
+		}
+	}
+
+	nixConfPath := filepath.Join(homeDir, ".config", "nix", "nix.conf")
+	if _, err := os.Stat(nixConfPath); os.IsNotExist(err) {
+		_ = os.WriteFile(nixConfPath, []byte("experimental-features = nix-command flakes\nsandbox = false\nbuild-users-group =\nfilter-syscalls = false\n"), 0o644)
+	}
+
+	configNixPath := filepath.Join(homeDir, ".config", "orbit", "configuration.nix")
+	if _, err := os.Stat(configNixPath); os.IsNotExist(err) {
+		if err := os.WriteFile(configNixPath, []byte(DefaultConfigurationNix), 0o644); err != nil {
+			return fmt.Errorf("writing configuration.nix: %w", err)
+		}
+	}
+
+	nixProfileLink := filepath.Join(homeDir, ".nix-profile")
+	if _, err := os.Lstat(nixProfileLink); os.IsNotExist(err) {
+		if _, statErr := os.Stat("/nix/var/nix/profiles/per-user/orbit/profile"); statErr == nil {
+			_ = os.Symlink("/nix/var/nix/profiles/per-user/orbit/profile", nixProfileLink)
 		}
 	}
 
@@ -475,6 +535,7 @@ func buildBashrcBlock(homeDir string) string {
 	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
 	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	return fmt.Sprintf(`%s
+export PATH="%s/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/usr/local/bin:$PATH"
 export STARSHIP_CONFIG=%q
 export COLORTERM="truecolor"
 export TERM="${TERM:-xterm-256color}"
@@ -489,6 +550,7 @@ if [[ $- == *i* ]]; then
   printf '  \033[1;33morbit\033[0m                    Launch interactive Orbit workspace & tool assistant\n'
   printf '  \033[1;33morbit repos\033[0m              Fetch & clone workspace repositories\n'
   printf '  \033[1;33morbit flake init [stack]\033[0m Initialize Nix flake + direnv .envrc\n'
+  printf '  \033[1;33morbit rebuild\033[0m            Apply ~/.config/orbit/configuration.nix packages\n'
   printf '  \033[1;33morbit tools [tool...]\033[0m    Configure AI coding tools (claude, codex, gemini, opencode, cursor, aider)\n'
   printf '  \033[1;33morbit git\033[0m                Configure Git author identity & defaults\n'
   printf '  \033[1;33morbit ssh-key\033[0m            Generate or import your Git SSH key\n'
@@ -496,5 +558,5 @@ if [[ $- == *i* ]]; then
   printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n\n'
 fi
 %s
-`, bashrcMarkerStart, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
+`, bashrcMarkerStart, homeDir, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
 }

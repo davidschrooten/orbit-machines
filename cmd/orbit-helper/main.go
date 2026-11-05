@@ -325,6 +325,36 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		},
 	}
 
+	var (
+		rebuildPrintPath bool
+		rebuildAddPkgs   []string
+	)
+	rebuildCmd := &cobra.Command{
+		Use:     "rebuild [package...]",
+		Aliases: []string{"config-nix", "nix-rebuild"},
+		Short:   "Apply declarative Nix system packages from ~/.config/orbit/configuration.nix",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if rebuildPrintPath {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), mgr.ConfigurationNixPath())
+				return nil
+			}
+			pkgs := append([]string(nil), rebuildAddPkgs...)
+			pkgs = append(pkgs, args...)
+			if len(pkgs) > 0 {
+				if err := mgr.AddConfigurationNixPackages(pkgs); err != nil {
+					return err
+				}
+			}
+			if err := mgr.ApplyConfigurationNix(cmd.Context()); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Applied Nix packages from %s\n", mgr.ConfigurationNixPath())
+			return nil
+		},
+	}
+	rebuildCmd.Flags().BoolVar(&rebuildPrintPath, "path", false, "Print the path to ~/.config/orbit/configuration.nix")
+	rebuildCmd.Flags().StringSliceVar(&rebuildAddPkgs, "add", nil, "Add Nixpkgs attribute names to configuration.nix before rebuilding")
+
 	versionCmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print the orbit-helper version",
@@ -333,6 +363,6 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		},
 	}
 
-	rootCmd.AddCommand(menuCmd, initCmd, reposCmd, flakeCmd, toolsCmd, gitCmd, sshKeyCmd, statusCmd, saveCmd, versionCmd)
+	rootCmd.AddCommand(menuCmd, initCmd, reposCmd, flakeCmd, toolsCmd, gitCmd, sshKeyCmd, statusCmd, saveCmd, rebuildCmd, versionCmd)
 	return rootCmd
 }

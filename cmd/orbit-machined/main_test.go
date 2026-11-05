@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -156,5 +157,39 @@ func TestMachinedCLI_HookUploadEnvOutPaths(t *testing.T) {
 	want := []string{"/nix/store/arg1", "/nix/store/env1", "/nix/store/env2"}
 	if !reflect.DeepEqual(gotPaths, want) {
 		t.Errorf("gotPaths = %v, want %v", gotPaths, want)
+	}
+}
+
+func TestMachinedCLI_SeedNixCommand(t *testing.T) {
+	srcDir := filepath.Join(t.TempDir(), "src-nix")
+	dstDir := filepath.Join(t.TempDir(), "dst-nix")
+
+	if err := os.MkdirAll(filepath.Join(srcDir, "store", "abc-pkg", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "store", "abc-pkg", "bin", "hello"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_ = os.Symlink("store/abc-pkg/bin/hello", filepath.Join(srcDir, "hello-link"))
+
+	t.Setenv("ORBIT_SEED_NIX_PURE_GO", "1")
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"seed-nix", "--source=" + srcDir, "--target=" + dstDir}, &out, &errOut, Runners{})
+	if code != 0 {
+		t.Fatalf("seed-nix failed: code=%d stderr=%s", code, errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "store", "abc-pkg", "bin", "hello")); err != nil {
+		t.Fatalf("expected seeded store file to exist: %v", err)
+	}
+	if linkTarget, err := os.Readlink(filepath.Join(dstDir, "hello-link")); err != nil || linkTarget != "store/abc-pkg/bin/hello" {
+		t.Fatalf("expected symlink to be preserved, got (%q, %v)", linkTarget, err)
+	}
+	// Second run is idempotent when .orbit-nix-seeded exists
+	if code := run(context.Background(), []string{"seed-nix", "--source=" + srcDir, "--target=" + dstDir}, &out, &errOut, Runners{}); code != 0 {
+		t.Fatalf("second seed-nix failed: code=%d", code)
+	}
+	// Empty source/target returns exit code 1
+	if code := run(context.Background(), []string{"seed-nix", "--source=", "--target="}, &out, &errOut, Runners{}); code != 1 {
+		t.Fatalf("expected exit code 1 for empty source/target, got %d", code)
 	}
 }

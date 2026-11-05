@@ -465,3 +465,121 @@ func TestHTTPPodOrchestrator_EdgeCasesAndErrors(t *testing.T) {
 		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
 	}
 }
+
+func TestHTTPPodOrchestrator_EnsureWorkspacePVCLifecycle(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu   sync.Mutex
+		pvcs = make(map[string]k8s.PVCManifest)
+		pods = make(map[string]k8s.PodManifest)
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/orbit-machines/pods":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(k8s.PodList{})
+
+		case r.Method == http.MethodGet && len(r.URL.Path) > len("/api/v1/namespaces/orbit-machines/pods/"):
+			name := r.URL.Path[len("/api/v1/namespaces/orbit-machines/pods/"):]
+			p, ok := pods[name]
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(p)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/orbit-machines/pods":
+			var manifest k8s.PodManifest
+			_ = json.NewDecoder(r.Body).Decode(&manifest)
+			pods[manifest.Metadata.Name] = manifest
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(manifest)
+
+		case r.Method == http.MethodDelete && len(r.URL.Path) > len("/api/v1/namespaces/orbit-machines/pods/"):
+			name := r.URL.Path[len("/api/v1/namespaces/orbit-machines/pods/"):]
+			delete(pods, name)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && len(r.URL.Path) > len("/api/v1/namespaces/orbit-machines/persistentvolumeclaims/"):
+			name := r.URL.Path[len("/api/v1/namespaces/orbit-machines/persistentvolumeclaims/"):]
+			pvc, ok := pvcs[name]
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(pvc)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/orbit-machines/persistentvolumeclaims":
+			var pvc k8s.PVCManifest
+			_ = json.NewDecoder(r.Body).Decode(&pvc)
+			pvcs[pvc.Metadata.Name] = pvc
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(pvc)
+
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	orch, err := k8s.NewHTTPPodOrchestrator(k8s.HTTPConfig{
+		APIServerURL:      srv.URL,
+		Manifest:          k8s.ManifestConfig{Namespace: "orbit-machines", MachineImage: "img:1"},
+		MaxConcurrentPods: 5,
+		HTTPClient:        srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPPodOrchestrator: %v", err)
+	}
+
+	mid, _ := domain.NewMachineID("ws_pvc", "usr_pvc")
+	ctx := context.Background()
+
+	// 1. First EnsurePod creates the PVC and mounts it on the Pod's workspace volume.
+	if _, err := orch.EnsurePod(ctx, k8s.PodRequest{MachineID: mid}); err != nil {
+		t.Fatalf("EnsurePod 1: %v", err)
+	}
+	wantPVC := mid.PodName() + "-ws"
+	wantNixPVC := mid.PodName() + "-nix"
+	mu.Lock()
+	createdPod := pods[mid.PodName()]
+	_, pvcExists := pvcs[wantPVC]
+	_, nixPVCExists := pvcs[wantNixPVC]
+	mu.Unlock()
+	if !pvcExists || !nixPVCExists {
+		t.Fatalf("expected PVCs %s and %s to be created", wantPVC, wantNixPVC)
+	}
+	if len(createdPod.Spec.InitContainers) != 1 || createdPod.Spec.InitContainers[0].Name != "seed-nix-store" {
+		t.Fatalf("expected seed-nix-store initContainer, got %+v", createdPod.Spec.InitContainers)
+	}
+	var wsVol, nixVol *k8s.Volume
+	for i := range createdPod.Spec.Volumes {
+		if createdPod.Spec.Volumes[i].Name == "workspace" {
+			wsVol = &createdPod.Spec.Volumes[i]
+		}
+		if createdPod.Spec.Volumes[i].Name == "nix-store" {
+			nixVol = &createdPod.Spec.Volumes[i]
+		}
+	}
+	if wsVol == nil || wsVol.PersistentVolumeClaim == nil || wsVol.PersistentVolumeClaim.ClaimName != wantPVC {
+		t.Fatalf("expected workspace volume to mount PVC %q, got %+v", wantPVC, wsVol)
+	}
+	if nixVol == nil || nixVol.PersistentVolumeClaim == nil || nixVol.PersistentVolumeClaim.ClaimName != wantNixPVC {
+		t.Fatalf("expected nix-store volume to mount PVC %q, got %+v", wantNixPVC, nixVol)
+	}
+
+	// 2. Delete Pod and call EnsurePod again -> reuses existing PVC.
+	_ = orch.DeletePod(ctx, mid)
+	if _, err := orch.EnsurePod(ctx, k8s.PodRequest{MachineID: mid}); err != nil {
+		t.Fatalf("EnsurePod 2 (reuse PVC): %v", err)
+	}
+}

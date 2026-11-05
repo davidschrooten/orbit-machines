@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/domain"
 	"github.com/davidschrooten/orbit-machines/internal/helper"
 	"github.com/davidschrooten/orbit-machines/internal/pty"
+	"github.com/davidschrooten/orbit-machines/internal/shellinit"
+	"github.com/davidschrooten/orbit-machines/internal/storage"
 	"github.com/davidschrooten/orbit-machines/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -34,6 +37,7 @@ const Version = "0.1.0"
 type Runners struct {
 	Serve      func(ctx context.Context, cfg config.MachinedConfig) error
 	HookUpload func(ctx context.Context, storePaths []string) error
+	SeedNix    func(ctx context.Context, srcDir, dstDir string) error
 }
 
 func main() {
@@ -58,6 +62,9 @@ func NewRootCmd(stdout, stderr io.Writer, runners Runners) *cobra.Command {
 	}
 	if runners.HookUpload == nil {
 		runners.HookUpload = defaultHookUploadRunner(stderr)
+	}
+	if runners.SeedNix == nil {
+		runners.SeedNix = defaultSeedNixRunner(stderr)
 	}
 
 	var configFile string
@@ -97,6 +104,20 @@ func NewRootCmd(stdout, stderr io.Writer, runners Runners) *cobra.Command {
 		},
 	}
 
+	var (
+		seedSrc string
+		seedDst string
+	)
+	seedNixCmd := &cobra.Command{
+		Use:   "seed-nix",
+		Short: "Seed a mounted /nix volume from the container image's /nix store",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runners.SeedNix(cmd.Context(), seedSrc, seedDst)
+		},
+	}
+	seedNixCmd.Flags().StringVar(&seedSrc, "source", "/nix", "Source /nix directory in container image")
+	seedNixCmd.Flags().StringVar(&seedDst, "target", "/mnt/nix", "Target mounted /nix volume directory")
+
 	versionCmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print the orbit-machined version",
@@ -105,7 +126,7 @@ func NewRootCmd(stdout, stderr io.Writer, runners Runners) *cobra.Command {
 		},
 	}
 
-	rootCmd.AddCommand(serveCmd, hookUploadCmd, versionCmd)
+	rootCmd.AddCommand(serveCmd, hookUploadCmd, seedNixCmd, versionCmd)
 	return rootCmd
 }
 
@@ -125,6 +146,16 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		logger := slog.New(slog.NewJSONHandler(logOut, nil))
 		homeDir := resolveHomeDir(cfg.WorkDir)
 
+		var vault *storage.ProfileVault
+		if strings.TrimSpace(cfg.S3Endpoint) != "" && len(cfg.ProfileEncryptionKey) == 32 {
+			if store, storeErr := storage.NewHTTPObjectStore(cfg.S3Endpoint, nil); storeErr == nil {
+				if v, vErr := storage.NewProfileVault(store, cfg.S3ProfileBucket, cfg.ProfileEncryptionKey); vErr == nil {
+					vault = v
+					_, _ = vault.HydrateProfile(ctx, cfg.MachineID, homeDir)
+				}
+			}
+		}
+
 		mgr, _ := helper.NewManager(helper.Config{
 			HomeDir: homeDir,
 			WorkDir: cfg.WorkDir,
@@ -139,6 +170,11 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 				}
 			}
 			_ = mgr.EnsureGitAndSSH()
+			if cfgNixBytes, readErr := os.ReadFile(mgr.ConfigurationNixPath()); readErr == nil &&
+				strings.TrimSpace(string(cfgNixBytes)) != "" &&
+				string(cfgNixBytes) != shellinit.DefaultConfigurationNix {
+				_ = mgr.ApplyConfigurationNix(ctx)
+			}
 			_, _ = mgr.AutoloadAllWorkspaceFlakes(ctx)
 		}
 
@@ -146,6 +182,12 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 			WorkspaceDir: cfg.WorkDir,
 			ShellSpawner: func(spawnCtx context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 				return spawnShellPane(spawnCtx, homeDir, cfg.WorkDir, tabID, "Starship Shell ("+tabID+")", cols, rows), nil
+			},
+			OnSnapshot: func(snapCtx context.Context) ([]string, error) {
+				if vault != nil {
+					_ = vault.SnapshotProfile(snapCtx, cfg.MachineID, homeDir)
+				}
+				return nil, nil
 			},
 			OnContextUpdate: func(req tui.ContextUpdateRequest) error {
 				return applyContextUpdate(mgr, req)
@@ -184,6 +226,9 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		case <-ctx.Done():
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			if vault != nil {
+				_ = vault.SnapshotProfile(shutCtx, cfg.MachineID, homeDir)
+			}
 			_ = httpSrv.Shutdown(shutCtx)
 			return <-errCh
 		case serveErr := <-errCh:
@@ -273,4 +318,99 @@ func defaultHookUploadRunner(logOut io.Writer) func(context.Context, []string) e
 		logger.InfoContext(ctx, "nix post-build-hook queued paths", slog.Int("count", len(storePaths)))
 		return nil
 	}
+}
+
+func defaultSeedNixRunner(logOut io.Writer) func(context.Context, string, string) error {
+	return func(ctx context.Context, srcDir, dstDir string) error {
+		srcDir = strings.TrimSpace(srcDir)
+		dstDir = strings.TrimSpace(dstDir)
+		if srcDir == "" || dstDir == "" {
+			return fmt.Errorf("%w: source and target directories are required", domain.ErrInvalidConfig)
+		}
+		logger := slog.New(slog.NewJSONHandler(logOut, nil))
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return err
+		}
+
+		markerPath := filepath.Join(dstDir, ".orbit-nix-seeded")
+		if _, err := os.Stat(markerPath); err == nil {
+			if _, storeErr := os.Stat(filepath.Join(dstDir, "store")); storeErr == nil {
+				ensureNixSubdirs(dstDir)
+				return nil
+			}
+		}
+
+		if info, err := os.Stat(srcDir); err == nil && info.IsDir() {
+			copiedWithCP := false
+			if os.Getenv("ORBIT_SEED_NIX_PURE_GO") == "" {
+				if cpPath, lookErr := exec.LookPath("cp"); lookErr == nil {
+					if runErr := exec.CommandContext(ctx, cpPath, "-a", filepath.Clean(srcDir)+"/.", filepath.Clean(dstDir)+"/").Run(); runErr == nil {
+						copiedWithCP = true
+					}
+				}
+			}
+			if !copiedWithCP {
+				if err := copyNixTree(srcDir, dstDir); err != nil {
+					return err
+				}
+			}
+		}
+
+		ensureNixSubdirs(dstDir)
+		_ = os.WriteFile(markerPath, []byte("seeded\n"), 0o644)
+		logger.InfoContext(ctx, "seeded nix store volume", slog.String("source", srcDir), slog.String("target", dstDir))
+		return nil
+	}
+}
+
+func ensureNixSubdirs(nixRoot string) {
+	for _, sub := range []string{
+		"store",
+		"var/nix/db",
+		"var/nix/profiles/per-user/orbit",
+		"var/nix/gcroots/per-user/orbit",
+		"var/nix/temproots",
+	} {
+		_ = os.MkdirAll(filepath.Join(nixRoot, sub), 0o755)
+	}
+}
+
+func copyNixTree(srcRoot, dstRoot string) error {
+	return filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		target := filepath.Join(dstRoot, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			linkDest, linkErr := os.Readlink(path)
+			if linkErr != nil {
+				return linkErr
+			}
+			_ = os.MkdirAll(filepath.Dir(target), 0o755)
+			_ = os.Remove(target)
+			return os.Symlink(linkDest, target)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, info.Mode().Perm())
+	})
 }
