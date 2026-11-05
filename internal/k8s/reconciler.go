@@ -50,6 +50,7 @@ type PodRequest struct {
 	OrbitMCPToken           string
 	RepositoriesJSON        string
 	WorkspacePVCName        string
+	NixStorePVCName         string
 }
 
 // PodEndpoint contains routing details for an active or provisioning Machine Pod.
@@ -115,6 +116,7 @@ type PodSpec struct {
 	AutomountServiceAccountToken *bool              `json:"automountServiceAccountToken"`
 	SecurityContext              PodSecurityContext `json:"securityContext"`
 	Volumes                      []Volume           `json:"volumes"`
+	InitContainers               []Container        `json:"initContainers,omitempty"`
 	Containers                   []Container        `json:"containers"`
 }
 
@@ -268,6 +270,17 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 		env = append(env, EnvVar{Name: "ORBIT_USER_EMAIL", Value: req.UserEmail})
 	}
 
+	nixStoreVolume := Volume{
+		Name:     "nix-store",
+		EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
+	}
+	if nixPVC := strings.TrimSpace(req.NixStorePVCName); nixPVC != "" {
+		nixStoreVolume = Volume{
+			Name:                  "nix-store",
+			PersistentVolumeClaim: &PVCVolumeSource{ClaimName: nixPVC},
+		}
+	}
+
 	workspaceVolume := Volume{
 		Name:     "workspace",
 		EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
@@ -309,11 +322,37 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 				},
 			},
 			Volumes: []Volume{
-				{
-					Name:     "nix-store",
-					EmptyDir: &EmptyDirVolume{SizeLimit: specs.EphemeralStorageLimit},
-				},
+				nixStoreVolume,
 				workspaceVolume,
+			},
+			InitContainers: []Container{
+				{
+					Name:            "seed-nix-store",
+					Image:           cfg.MachineImage,
+					ImagePullPolicy: "IfNotPresent",
+					Args:            []string{"seed-nix", "--source", "/nix", "--target", "/mnt/nix"},
+					Resources: ResourceRequirements{
+						Requests: map[string]string{
+							"cpu":    specs.CPURequest,
+							"memory": specs.MemoryRequest,
+						},
+						Limits: map[string]string{
+							"cpu":               specs.CPULimit,
+							"memory":            specs.MemoryLimit,
+							"ephemeral-storage": specs.EphemeralStorageLimit,
+						},
+					},
+					VolumeMounts: []VolumeMount{
+						{Name: "nix-store", MountPath: "/mnt/nix"},
+					},
+					SecurityContext: ContainerSecurityContext{
+						AllowPrivilegeEscalation: false,
+						RunAsNonRoot:             true,
+						Capabilities: Capabilities{
+							Drop: []string{"ALL"},
+						},
+					},
+				},
 			},
 			Containers: []Container{
 				{
@@ -425,8 +464,13 @@ func (o *HTTPPodOrchestrator) EnsurePod(ctx context.Context, req PodRequest) (Po
 	}
 
 	if strings.TrimSpace(req.WorkspacePVCName) == "" {
-		if pvcName, pvcErr := o.ensureWorkspacePVC(ctx, req); pvcErr == nil && pvcName != "" {
+		if pvcName, pvcErr := o.ensurePVC(ctx, req, req.MachineID.PodName()+"-ws"); pvcErr == nil && pvcName != "" {
 			req.WorkspacePVCName = pvcName
+		}
+	}
+	if strings.TrimSpace(req.NixStorePVCName) == "" {
+		if pvcName, pvcErr := o.ensurePVC(ctx, req, req.MachineID.PodName()+"-nix"); pvcErr == nil && pvcName != "" {
+			req.NixStorePVCName = pvcName
 		}
 	}
 
@@ -444,8 +488,7 @@ func (o *HTTPPodOrchestrator) EnsurePod(ctx context.Context, req PodRequest) (Po
 	return podEndpointFromManifest(created), nil
 }
 
-func (o *HTTPPodOrchestrator) ensureWorkspacePVC(ctx context.Context, req PodRequest) (string, error) {
-	pvcName := req.MachineID.PodName() + "-ws"
+func (o *HTTPPodOrchestrator) ensurePVC(ctx context.Context, req PodRequest, pvcName string) (string, error) {
 	getURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", o.apiServerURL, o.manifestCfg.Namespace, pvcName)
 	var existing PVCManifest
 	if err := o.doJSON(ctx, http.MethodGet, getURL, nil, &existing); err == nil {

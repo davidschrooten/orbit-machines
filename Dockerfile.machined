@@ -6,29 +6,52 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/orbit-machined ./cmd/orbit-machined && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/orbit-helper ./cmd/orbit-helper
 
-FROM alpine:3.21
-RUN apk add --no-cache \
-    ca-certificates \
-    bash \
-    starship \
-    direnv \
-    git \
-    github-cli \
-    htop \
-    curl \
-    wget \
-    jq \
-    ripgrep \
-    openssh-client \
-    ncurses-terminfo-base && \
-    addgroup -g 1000 orbit && \
-    adduser -D -u 1000 -G orbit -h /home/orbit -s /bin/bash orbit && \
-    mkdir -p /home/orbit/workspace /nix && \
-    chown -R 1000:1000 /home/orbit /nix
+FROM nixos/nix:latest
+COPY nix/configuration.nix /etc/orbit/configuration.nix
+RUN mkdir -p /etc/nix \
+      /usr/local/bin \
+      /usr/bin \
+      /bin \
+      /home/orbit/.config/orbit \
+      /home/orbit/workspace \
+      /nix/var/nix/profiles/per-user/orbit \
+      /nix/var/nix/gcroots/per-user/orbit \
+      /nix/var/nix/temproots && \
+    printf "experimental-features = nix-command flakes\nbuild-users-group =\nsandbox = false\nfilter-syscalls = false\n" > /etc/nix/nix.conf && \
+    nix-env -p /nix/var/nix/profiles/orbit -i -f /etc/orbit/configuration.nix && \
+    nix-collect-garbage -d && \
+    ln -sf "$(readlink -f /nix/var/nix/profiles/orbit)" /nix/var/nix/profiles/per-user/orbit/profile-1-link && \
+    ln -sf profile-1-link /nix/var/nix/profiles/per-user/orbit/profile && \
+    ln -sf /nix/var/nix/profiles/per-user/orbit/profile /home/orbit/.nix-profile && \
+    if [ -e /nix/var/nix/profiles/per-user/root/channels ]; then \
+      ln -sf /nix/var/nix/profiles/per-user/root/channels /nix/var/nix/profiles/per-user/orbit/channels && \
+      ln -sf /nix/var/nix/profiles/per-user/orbit/channels /home/orbit/.nix-defexpr; \
+    fi && \
+    cp /etc/orbit/configuration.nix /home/orbit/.config/orbit/configuration.nix && \
+    ln -sf /nix/var/nix/profiles/orbit/bin/bash /bin/bash && \
+    ln -sf /nix/var/nix/profiles/orbit/bin/bash /bin/sh && \
+    ln -sf /nix/var/nix/profiles/orbit/bin/env /usr/bin/env && \
+    grep -q '^orbit:' /etc/group || echo 'orbit:x:1000:' >> /etc/group && \
+    grep -q '^orbit:' /etc/passwd || echo 'orbit:x:1000:1000:Orbit Machine User:/home/orbit:/bin/bash' >> /etc/passwd && \
+    chmod 755 /root && \
+    chown -R 1000:1000 /home/orbit /nix /etc/nix
 
 COPY --from=builder /out/orbit-machined /usr/local/bin/orbit-machined
 COPY --from=builder /out/orbit-helper /usr/local/bin/orbit-helper
-RUN ln -sf /usr/local/bin/orbit-helper /usr/local/bin/orbit
+RUN ln -sf /usr/local/bin/orbit-helper /usr/local/bin/orbit && \
+    ln -sf /usr/local/bin/orbit-machined /nix/var/nix/profiles/orbit/bin/orbit-machined || true && \
+    ln -sf /usr/local/bin/orbit-helper /nix/var/nix/profiles/orbit/bin/orbit-helper || true && \
+    ln -sf /usr/local/bin/orbit-helper /nix/var/nix/profiles/orbit/bin/orbit || true
+
+ENV HOME=/home/orbit \
+    USER=orbit \
+    SHELL=/bin/bash \
+    PATH=/home/orbit/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin \
+    NIX_PATH=nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs:/nix/var/nix/profiles/per-user/root/channels \
+    SSL_CERT_FILE=/nix/var/nix/profiles/orbit/etc/ssl/certs/ca-bundle.crt \
+    NIX_SSL_CERT_FILE=/nix/var/nix/profiles/orbit/etc/ssl/certs/ca-bundle.crt \
+    OPENSSL_DIR=/nix/var/nix/profiles/orbit \
+    PKG_CONFIG_PATH=/nix/var/nix/profiles/orbit/lib/pkgconfig
 
 USER 1000:1000
 WORKDIR /home/orbit/workspace

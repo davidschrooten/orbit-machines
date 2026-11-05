@@ -44,6 +44,9 @@ type GitCloner func(ctx context.Context, cloneURL, destDir, branch string) error
 // DirenvAllower marks a repository directory's .envrc as trusted in direnv.
 type DirenvAllower func(ctx context.Context, dir string) error
 
+// NixEnvRunner installs the declarative Nix package environment from configNixPath.
+type NixEnvRunner func(ctx context.Context, configNixPath string) error
+
 // OrbitContext holds workspace, user, MCP, and repository metadata synced from Orbit.
 type OrbitContext struct {
 	OrbitURL      string                    `json:"orbit_url"`
@@ -137,6 +140,7 @@ type Config struct {
 	MachinedURL   string
 	GitCloner     GitCloner
 	DirenvAllower DirenvAllower
+	NixEnvRunner  NixEnvRunner
 	HTTPClient    *http.Client
 }
 
@@ -148,6 +152,7 @@ type Manager struct {
 	machinedURL   string
 	gitCloner     GitCloner
 	direnvAllower DirenvAllower
+	nixEnvRunner  NixEnvRunner
 	httpClient    *http.Client
 }
 
@@ -176,6 +181,12 @@ func NewManager(cfg Config) (*Manager, error) {
 	if allower == nil {
 		allower = defaultDirenvAllower
 	}
+	nixRunner := cfg.NixEnvRunner
+	if nixRunner == nil {
+		nixRunner = func(ctx context.Context, configNixPath string) error {
+			return defaultNixEnvRunner(ctx, homeDir, configNixPath)
+		}
+	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -188,6 +199,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		machinedURL:   machinedURL,
 		gitCloner:     cloner,
 		direnvAllower: allower,
+		nixEnvRunner:  nixRunner,
 		httpClient:    httpClient,
 	}
 	_ = m.EnsureGitAndSSH()
@@ -391,6 +403,79 @@ func (m *Manager) EnsureGitAndSSH() error {
 	if stateChanged {
 		_ = m.SaveState(st)
 	}
+	m.syncConfigurationNix()
+	return nil
+}
+
+// ConfigurationNixPath returns the path to ~/.config/orbit/configuration.nix.
+func (m *Manager) ConfigurationNixPath() string {
+	return filepath.Join(m.configDir, "configuration.nix")
+}
+
+func (m *Manager) syncConfigurationNix() {
+	homeCfgPath := m.ConfigurationNixPath()
+	wsCfgPath := filepath.Join(m.workDir, ".orbit", "configuration.nix")
+
+	homeData, homeErr := os.ReadFile(homeCfgPath)
+	wsData, wsErr := os.ReadFile(wsCfgPath)
+
+	if wsErr == nil && strings.TrimSpace(string(wsData)) != "" {
+		if homeErr != nil || strings.TrimSpace(string(homeData)) == "" || (string(homeData) == shellinit.DefaultConfigurationNix && string(wsData) != shellinit.DefaultConfigurationNix) {
+			_ = writeConfigFile(homeCfgPath, wsData, 0o644)
+			return
+		}
+	}
+	if homeErr == nil && strings.TrimSpace(string(homeData)) != "" {
+		_ = writeConfigFile(wsCfgPath, homeData, 0o644)
+		return
+	}
+	_ = writeConfigFile(homeCfgPath, []byte(shellinit.DefaultConfigurationNix), 0o644)
+	_ = writeConfigFile(wsCfgPath, []byte(shellinit.DefaultConfigurationNix), 0o644)
+}
+
+// AddConfigurationNixPackages adds the given Nixpkgs package attribute names to ~/.config/orbit/configuration.nix
+// (if not already present) and mirrors the updated file into <workDir>/.orbit/configuration.nix.
+func (m *Manager) AddConfigurationNixPackages(packages []string) error {
+	pkgs := cleanSlice(packages)
+	if len(pkgs) == 0 {
+		return nil
+	}
+	m.syncConfigurationNix()
+	homeCfgPath := m.ConfigurationNixPath()
+	data, err := os.ReadFile(homeCfgPath)
+	if err != nil {
+		data = []byte(shellinit.DefaultConfigurationNix)
+	}
+	content := string(data)
+	idx := strings.LastIndex(content, "];")
+	if idx < 0 {
+		return fmt.Errorf("%w: invalid configuration.nix format (missing '];')", domain.ErrInvalidConfig)
+	}
+	var addLines strings.Builder
+	for _, pkg := range pkgs {
+		if !strings.Contains(content, " "+pkg+"\n") && !strings.Contains(content, "\t"+pkg+"\n") {
+			addLines.WriteString("    " + pkg + "\n")
+		}
+	}
+	updated := content[:idx] + addLines.String() + content[idx:]
+	if err := writeConfigFile(homeCfgPath, []byte(updated), 0o644); err != nil {
+		return err
+	}
+	return writeConfigFile(filepath.Join(m.workDir, ".orbit", "configuration.nix"), []byte(updated), 0o644)
+}
+
+// ApplyConfigurationNix mirrors ~/.config/orbit/configuration.nix into <workDir>/.orbit/configuration.nix,
+// invokes nix-env -i -f ~/.config/orbit/configuration.nix, and triggers a profile snapshot.
+func (m *Manager) ApplyConfigurationNix(ctx context.Context) error {
+	m.syncConfigurationNix()
+	homeCfgPath := m.ConfigurationNixPath()
+	if data, err := os.ReadFile(homeCfgPath); err == nil && strings.TrimSpace(string(data)) != "" {
+		_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "configuration.nix"), data, 0o644)
+	}
+	if err := m.nixEnvRunner(ctx, homeCfgPath); err != nil {
+		return err
+	}
+	m.triggerSnapshot()
 	return nil
 }
 
@@ -966,8 +1051,9 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 		_, _ = fmt.Fprintln(out, "  [4] Show status & save profile snapshot")
 		_, _ = fmt.Fprintln(out, "  [5] Configure Git identity (user.name, user.email, defaultBranch)")
 		_, _ = fmt.Fprintln(out, "  [6] Configure Git SSH key (generate Ed25519 or import key)")
+		_, _ = fmt.Fprintln(out, "  [7] Rebuild Nix system packages (~/.config/orbit/configuration.nix)")
 		_, _ = fmt.Fprintln(out, "  [q] Quit")
-		_, _ = fmt.Fprint(out, "\nSelect an option [1-6/q]: ")
+		_, _ = fmt.Fprint(out, "\nSelect an option [1-7/q]: ")
 
 		if !scanner.Scan() {
 			return nil
@@ -1066,6 +1152,18 @@ func (m *Manager) RunInteractive(ctx context.Context, in io.Reader, out io.Write
 		case "6", "ssh-key", "ssh":
 			if err := m.runInteractiveSSHKeyWithScanner(scanner, out); err != nil {
 				_, _ = fmt.Fprintf(out, "Error: %v\n", err)
+			}
+
+		case "7", "rebuild", "config-nix":
+			_, _ = fmt.Fprintf(out, "\n📦 Declarative Nix Configuration: %s\n", m.ConfigurationNixPath())
+			_, _ = fmt.Fprint(out, "Extra Nixpkgs packages to add (comma-separated, or blank to apply current file): ")
+			if scanner.Scan() && strings.TrimSpace(scanner.Text()) != "" {
+				_ = m.AddConfigurationNixPackages(strings.Split(scanner.Text(), ","))
+			}
+			if err := m.ApplyConfigurationNix(ctx); err != nil {
+				_, _ = fmt.Fprintf(out, "Error: %v\n", err)
+			} else {
+				_, _ = fmt.Fprintf(out, "✓ Applied Nix packages from %s\n", m.ConfigurationNixPath())
 			}
 
 		case "q", "quit", "exit", "0":
@@ -1369,6 +1467,20 @@ func defaultDirenvAllower(ctx context.Context, dir string) error {
 	}
 	cmd := exec.CommandContext(ctx, path, "allow", dir)
 	_ = cmd.Run()
+	return nil
+}
+
+func defaultNixEnvRunner(ctx context.Context, homeDir, configNixPath string) error {
+	path, err := exec.LookPath("nix-env")
+	if err != nil {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, path, "-i", "-f", configNixPath)
+	cmd.Env = append(gitEnvForHome(homeDir), "HOME="+homeDir)
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return fmt.Errorf("nix-env -i -f %s failed: %w (%s)", configNixPath, runErr, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 

@@ -23,6 +23,7 @@ func TestOrbitHelperCLI_Subcommands(t *testing.T) {
 			return os.MkdirAll(filepath.Join(destDir, ".git"), 0o755)
 		},
 		DirenvAllower: func(_ context.Context, _ string) error { return nil },
+		NixEnvRunner:  func(_ context.Context, _ string) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -140,6 +141,12 @@ func TestOrbitHelperCLI_Subcommands(t *testing.T) {
 	}
 	if code, out, _ := execCLI("", "save"); code != 0 || !strings.Contains(out, "Saved") {
 		t.Fatalf("save failed: code=%d out=%q", code, out)
+	}
+	if code, out, _ := execCLI("", "rebuild", "--path"); code != 0 || !strings.Contains(out, "configuration.nix") {
+		t.Fatalf("rebuild --path failed: code=%d out=%q", code, out)
+	}
+	if code, out, errOut := execCLI("", "rebuild", "--add", "tmux", "neovim"); code != 0 || !strings.Contains(out, "Applied Nix packages") {
+		t.Fatalf("rebuild --add failed: code=%d out=%q err=%q", code, out, errOut)
 	}
 
 	// 7. default interactive menu (root command & menu subcommand)

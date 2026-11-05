@@ -549,21 +549,32 @@ func TestHTTPPodOrchestrator_EnsureWorkspacePVCLifecycle(t *testing.T) {
 		t.Fatalf("EnsurePod 1: %v", err)
 	}
 	wantPVC := mid.PodName() + "-ws"
+	wantNixPVC := mid.PodName() + "-nix"
 	mu.Lock()
 	createdPod := pods[mid.PodName()]
 	_, pvcExists := pvcs[wantPVC]
+	_, nixPVCExists := pvcs[wantNixPVC]
 	mu.Unlock()
-	if !pvcExists {
-		t.Fatalf("expected PVC %s to be created", wantPVC)
+	if !pvcExists || !nixPVCExists {
+		t.Fatalf("expected PVCs %s and %s to be created", wantPVC, wantNixPVC)
 	}
-	var wsVol *k8s.Volume
+	if len(createdPod.Spec.InitContainers) != 1 || createdPod.Spec.InitContainers[0].Name != "seed-nix-store" {
+		t.Fatalf("expected seed-nix-store initContainer, got %+v", createdPod.Spec.InitContainers)
+	}
+	var wsVol, nixVol *k8s.Volume
 	for i := range createdPod.Spec.Volumes {
 		if createdPod.Spec.Volumes[i].Name == "workspace" {
 			wsVol = &createdPod.Spec.Volumes[i]
 		}
+		if createdPod.Spec.Volumes[i].Name == "nix-store" {
+			nixVol = &createdPod.Spec.Volumes[i]
+		}
 	}
 	if wsVol == nil || wsVol.PersistentVolumeClaim == nil || wsVol.PersistentVolumeClaim.ClaimName != wantPVC {
 		t.Fatalf("expected workspace volume to mount PVC %q, got %+v", wantPVC, wsVol)
+	}
+	if nixVol == nil || nixVol.PersistentVolumeClaim == nil || nixVol.PersistentVolumeClaim.ClaimName != wantNixPVC {
+		t.Fatalf("expected nix-store volume to mount PVC %q, got %+v", wantNixPVC, nixVol)
 	}
 
 	// 2. Delete Pod and call EnsurePod again -> reuses existing PVC.
