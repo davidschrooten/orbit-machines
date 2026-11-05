@@ -3,12 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
+	"github.com/davidschrooten/orbit-machines/internal/k8s"
 )
 
 func TestDispatcherCLI_VersionAndServe(t *testing.T) {
@@ -95,4 +103,46 @@ func TestDispatcherCLI_VersionAndServe(t *testing.T) {
 			t.Fatalf("expected exit code 1 on runner error, got %d", code)
 		}
 	})
+
+	t.Run("buildOrchestrator selects HTTP orchestrator in cluster and falls back out of cluster", func(t *testing.T) {
+		t.Parallel()
+		cfg := config.DispatcherConfig{
+			KubernetesNamespace: "orbit-machines",
+			MachineImage:        "ghcr.io/davidschrooten/orbit-machined:0.1.0",
+			MaxConcurrentPods:   10,
+		}
+		if _, ok := buildOrchestrator(cfg, "", "", "", "").(*k8s.FakePodOrchestrator); !ok {
+			t.Fatalf("expected FakePodOrchestrator when KUBERNETES_SERVICE_HOST is empty")
+		}
+
+		dir := t.TempDir()
+		tokFile := filepath.Join(dir, "token")
+		caFile := filepath.Join(dir, "ca.crt")
+		_ = os.WriteFile(tokFile, []byte("sa-token-xyz\n"), 0o600)
+		_ = os.WriteFile(caFile, generateSelfSignedCAPEM(t), 0o600)
+
+		if _, ok := buildOrchestrator(cfg, "10.43.0.1", "", tokFile, caFile).(*k8s.HTTPPodOrchestrator); !ok {
+			t.Fatalf("expected HTTPPodOrchestrator when KUBERNETES_SERVICE_HOST is set")
+		}
+	})
+}
+
+func generateSelfSignedCAPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }

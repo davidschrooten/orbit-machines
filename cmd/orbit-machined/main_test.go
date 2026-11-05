@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
 )
@@ -54,8 +55,15 @@ func TestMachinedCLI_Commands(t *testing.T) {
 	t.Run("serve subcommand with default runner succeeds", func(t *testing.T) {
 		t.Parallel()
 		var out, errOut bytes.Buffer
-		args := []string{"serve", "--workspace-id=ws_1", "--user-id=usr_1"}
-		code := run(context.Background(), args, &out, &errOut, Runners{})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		args := []string{
+			"serve",
+			"--listen-addr=127.0.0.1:0",
+			"--workspace-id=ws_1",
+			"--user-id=usr_1",
+		}
+		code := run(ctx, args, &out, &errOut, Runners{})
 		if code != 0 {
 			t.Fatalf("run(serve default) code = %d, stderr = %s", code, errOut.String())
 		}

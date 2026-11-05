@@ -4,7 +4,10 @@ package dispatcher
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -188,11 +191,12 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := s.orchestrator.EnsurePod(sessCtx, k8s.PodRequest{
-		MachineID:     mid,
-		WorkspaceSlug: claims.WorkspaceSlug,
-		UserEmail:     claims.UserLogin,
-		Tier:          claims.Tier,
-		OrbitMCPToken: mcpToken,
+		MachineID:               mid,
+		WorkspaceSlug:           claims.WorkspaceSlug,
+		UserEmail:               claims.UserLogin,
+		Tier:                    claims.Tier,
+		ProfileEncryptionKeyHex: s.deriveProfileKeyHex(mid),
+		OrbitMCPToken:           mcpToken,
 	}); err != nil {
 		_ = clientConn.Close(websocket.StatusTryAgainLater, err.Error())
 		return
@@ -214,7 +218,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	podConn, _, err := websocket.Dial(sessCtx, ep.WebSocketURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
+	podConn, err := dialPodWebSocket(sessCtx, ep.WebSocketURL)
 	if err != nil {
 		_ = clientConn.Close(websocket.StatusBadGateway, "unable to dial pod websocket")
 		return
@@ -223,6 +227,29 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = podConn.CloseNow() }()
 
 	_ = spliceWebSockets(sessCtx, clientConn, podConn)
+}
+
+func (s *Server) deriveProfileKeyHex(mid domain.MachineID) string {
+	mac := hmac.New(sha256.New, []byte(s.clusterToken))
+	_, _ = mac.Write([]byte("orbit-profile-key:v1:" + mid.PodName()))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func dialPodWebSocket(ctx context.Context, wsURL string) (*websocket.Conn, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		conn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose // coder/websocket manages response body lifecycle
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil, lastErr
 }
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
