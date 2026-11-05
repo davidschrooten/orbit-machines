@@ -262,17 +262,11 @@ func appendTabQuery(wsURL, tab string) string {
 }
 
 func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid domain.MachineID, claims ticket.Claims, mcpToken string, repos []protocol.RepoCredential) {
-	if ep.PodIP == "" && ep.WebSocketURL == "" {
-		return
-	}
-	if mcpToken == "" && len(repos) == 0 && s.orbitURL == "" {
-		return
-	}
 	targetURL := podContextURL(ep)
-	if targetURL == "" {
+	if targetURL == "" || (mcpToken == "" && len(repos) == 0 && s.orbitURL == "") {
 		return
 	}
-	payload := map[string]any{
+	body, _ := json.Marshal(map[string]any{
 		"orbit_url":       s.orbitURL,
 		"orbit_mcp_token": mcpToken,
 		"workspace_id":    mid.WorkspaceID(),
@@ -280,11 +274,7 @@ func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid dom
 		"user_id":         mid.UserID(),
 		"user_email":      claims.UserLogin,
 		"repositories":    repos,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
+	})
 	pushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, targetURL, bytes.NewReader(body))
@@ -292,24 +282,21 @@ func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid dom
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
+	if resp, doErr := http.DefaultClient.Do(req); doErr == nil {
 		_ = resp.Body.Close()
 	}
 }
 
 func podContextURL(ep k8s.PodEndpoint) string {
-	if u, err := url.Parse(strings.TrimSpace(ep.WebSocketURL)); err == nil && u.Host != "" {
-		scheme := "http"
-		if u.Scheme == "wss" || u.Scheme == "https" {
-			scheme = "https"
-		}
-		return fmt.Sprintf("%s://%s/api/v1/context", scheme, u.Host)
+	u, err := url.Parse(strings.TrimSpace(ep.WebSocketURL))
+	if err != nil || u.Host == "" {
+		return ""
 	}
-	if strings.TrimSpace(ep.PodIP) != "" {
-		return fmt.Sprintf("http://%s:8080/api/v1/context", strings.TrimSpace(ep.PodIP))
+	scheme := "http"
+	if u.Scheme == "wss" || u.Scheme == "https" {
+		scheme = "https"
 	}
-	return ""
+	return fmt.Sprintf("%s://%s/api/v1/context", scheme, u.Host)
 }
 
 func (s *Server) deriveProfileKeyHex(mid domain.MachineID) string {

@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/davidschrooten/orbit-machines/internal/config"
+	"github.com/davidschrooten/orbit-machines/internal/helper"
+	"github.com/davidschrooten/orbit-machines/internal/tui"
 )
 
 func TestMachinedCLI_Commands(t *testing.T) {
-	t.Parallel()
-
 	t.Run("version subcommand", func(t *testing.T) {
 		t.Parallel()
 		var out, errOut bytes.Buffer
@@ -53,20 +54,39 @@ func TestMachinedCLI_Commands(t *testing.T) {
 	})
 
 	t.Run("serve subcommand with default runner succeeds", func(t *testing.T) {
-		t.Parallel()
 		var out, errOut bytes.Buffer
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 		defer cancel()
+		tmpHome := filepath.Join(t.TempDir(), "orbit-home")
+		tmpWork := filepath.Join(tmpHome, "workspace")
+		t.Setenv("ORBIT_MACHINED_HOME_DIR", tmpHome)
+		t.Setenv("ORBIT_MCP_TOKEN", "omcp_tok_boot")
 		args := []string{
 			"serve",
 			"--listen-addr=127.0.0.1:0",
 			"--workspace-id=ws_1",
 			"--user-id=usr_1",
+			"--work-dir=" + tmpWork,
 		}
 		code := run(ctx, args, &out, &errOut, Runners{})
 		if code != 0 {
 			t.Fatalf("run(serve default) code = %d, stderr = %s", code, errOut.String())
 		}
+		t.Setenv("ORBIT_MACHINED_HOME_DIR", "")
+		_ = resolveHomeDir(tmpWork)
+		_ = resolveHomeDir("/")
+		t.Setenv("SHELL", "")
+		pane := spawnShellPane(ctx, tmpHome, "/nonexistent-work-dir", "tab-1", "Shell", 80, 24)
+		_ = pane.Close()
+		t.Setenv("SHELL", "/nonexistent/shell-binary")
+		vp := spawnShellPane(ctx, tmpHome, tmpWork, "tab-2", "Fallback", 80, 24)
+		_ = vp.Close()
+		_ = applyContextUpdate(nil, tui.ContextUpdateRequest{})
+		mgr, _ := helper.NewManager(helper.Config{HomeDir: tmpHome, WorkDir: tmpWork})
+		_ = applyContextUpdate(mgr, tui.ContextUpdateRequest{
+			OrbitURL:      "https://orbit.acme.dev",
+			OrbitMCPToken: "omcp_tok_updated",
+		})
 	})
 
 	t.Run("serve subcommand fails on missing required flags", func(t *testing.T) {

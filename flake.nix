@@ -27,6 +27,7 @@
         rec {
           orbit-dispatcher = buildOrbitPackage "orbit-dispatcher" "cmd/orbit-dispatcher";
           orbit-machined = buildOrbitPackage "orbit-machined" "cmd/orbit-machined";
+          orbit-helper = buildOrbitPackage "orbit-helper" "cmd/orbit-helper";
           default = pkgs.buildGoModule {
             pname = "orbit-machines";
             version = "0.1.0";
@@ -34,6 +35,7 @@
             subPackages = [
               "cmd/orbit-dispatcher"
               "cmd/orbit-machined"
+              "cmd/orbit-helper"
             ];
             vendorHash = null;
             ldflags = [ "-s" "-w" ];

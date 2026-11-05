@@ -481,12 +481,11 @@ func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 		t.Fatalf("unexpected Diff frame: %+v (%q)", diffFrame, string(diffFrame.Data))
 	}
 
-	// 4. Reconnect to tab-1 -> receives combined scrollback in initial snapshot.
+	// 4. Reconnect to tab-1 -> receives combined scrollback in initial snapshot, then close with 4000 ("close-tab").
 	conn1Reconnect, _, err := websocket.Dial(ctx, wsBase+"?tab=tab-1", nil) //nolint:bodyclose
 	if err != nil {
 		t.Fatalf("Dial tab-1 reconnect: %v", err)
 	}
-	defer func() { _ = conn1Reconnect.CloseNow() }()
 	_, rawReconSnap, err := conn1Reconnect.Read(ctx)
 	if err != nil {
 		t.Fatalf("Read reconnect snap: %v", err)
@@ -495,6 +494,7 @@ func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 	if !strings.Contains(string(reconSnap.Data), "workspace: orbit") {
 		t.Fatalf("expected reconnect scrollback to include 'workspace: orbit', got %q", string(reconSnap.Data))
 	}
+	_ = conn1Reconnect.Close(4000, "close-tab")
 
 	// 5. Close tab-2 via DELETE /api/v1/tabs/tab-2 and via CloseTab("").
 	wsSrv.CloseTab("")
