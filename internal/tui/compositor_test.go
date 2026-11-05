@@ -1,10 +1,14 @@
 package tui_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -353,5 +357,213 @@ func TestWSServer_60fpsDiffCoalescingSnapshotPingAndMetadata(t *testing.T) {
 	}
 	if !gotMeta {
 		t.Fatalf("expected FrameMetadata event from BroadcastMetadata")
+	}
+}
+
+func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu          sync.Mutex
+		spawnedPanes = make(map[string]*pty.Pane)
+		lastCtxReq  tui.ContextUpdateRequest
+		snapCount   int
+		failSpawn   bool
+	)
+
+	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+		ShellSpawner: func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if failSpawn {
+				return nil, errors.New("pty spawn failed")
+			}
+			p := pty.NewVirtualPane(tabID, "Starship Shell "+tabID, cols, rows)
+			p.FeedOutput([]byte("🪐 " + tabID + " $ "))
+			spawnedPanes[tabID] = p
+			return p, nil
+		},
+		OnActivity: func() {},
+		OnContextUpdate: func(req tui.ContextUpdateRequest) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if req.OrbitURL == "bad" {
+				return errors.New("context update failed")
+			}
+			lastCtxReq = req
+			return nil
+		},
+		OnSnapshot: func(_ context.Context) ([]string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			snapCount++
+			if snapCount > 1 {
+				return nil, errors.New("snapshot failed")
+			}
+			return []string{"orbit"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWSServer: %v", err)
+	}
+	defer func() { _ = wsSrv.Close() }()
+
+	httpSrv := httptest.NewServer(wsSrv.Handler())
+	defer httpSrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	codec, _ := protocol.NewFrameCodec()
+
+	// 1. Connect to default tab (/ws) -> spawns tab-1 and sends initial scrollback snapshot.
+	wsBase := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/ws"
+	conn1, _, err := websocket.Dial(ctx, wsBase, nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial tab-1: %v", err)
+	}
+	defer func() { _ = conn1.CloseNow() }()
+
+	_, rawSnap1, err := conn1.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read tab-1 snap: %v", err)
+	}
+	f1, _ := codec.Decode(rawSnap1)
+	if f1.Type != protocol.FrameSnapshot || !strings.Contains(string(f1.Data), "🪐 tab-1 $ ") {
+		t.Fatalf("unexpected tab-1 snapshot: %+v (%q)", f1, string(f1.Data))
+	}
+
+	// 2. Connect to second tab (/ws?tab=tab-2) -> spawns independent tab-2 session.
+	conn2, _, err := websocket.Dial(ctx, wsBase+"?tab=tab-2", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial tab-2: %v", err)
+	}
+	defer func() { _ = conn2.CloseNow() }()
+
+	_, rawSnap2, err := conn2.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read tab-2 snap: %v", err)
+	}
+	f2, _ := codec.Decode(rawSnap2)
+	if f2.Type != protocol.FrameSnapshot || !strings.Contains(string(f2.Data), "🪐 tab-2 $ ") {
+		t.Fatalf("unexpected tab-2 snapshot: %+v (%q)", f2, string(f2.Data))
+	}
+
+	// 3. Input, Resize, Ping, and raw output streaming on tab-1.
+	inBytes, _ := codec.EncodeInput([]byte("orbit-helper status\n"))
+	_ = conn1.Write(ctx, websocket.MessageBinary, inBytes)
+	rszBytes, _ := codec.EncodeResize(132, 40)
+	_ = conn1.Write(ctx, websocket.MessageBinary, rszBytes)
+	pingBytes, _ := codec.EncodePing(42)
+	_ = conn1.Write(ctx, websocket.MessageBinary, pingBytes)
+
+	_, rawPong, err := conn1.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read Pong: %v", err)
+	}
+	pongFrame, _ := codec.Decode(rawPong)
+	if pongFrame.Type != protocol.FramePong || pongFrame.TimestampMS != 42 {
+		t.Fatalf("unexpected Pong frame: %+v", pongFrame)
+	}
+
+	// Feed new output to tab-1 pane -> verify 0x11 FrameDiff arrives immediately on conn1.
+	mu.Lock()
+	p1 := spawnedPanes["tab-1"]
+	mu.Unlock()
+	p1.FeedOutput([]byte("workspace: orbit\r\n"))
+
+	_, rawDiff, err := conn1.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read Diff: %v", err)
+	}
+	diffFrame, _ := codec.Decode(rawDiff)
+	if diffFrame.Type != protocol.FrameDiff || string(diffFrame.Data) != "workspace: orbit\r\n" {
+		t.Fatalf("unexpected Diff frame: %+v (%q)", diffFrame, string(diffFrame.Data))
+	}
+
+	// 4. Reconnect to tab-1 -> receives combined scrollback in initial snapshot.
+	conn1Reconnect, _, err := websocket.Dial(ctx, wsBase+"?tab=tab-1", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial tab-1 reconnect: %v", err)
+	}
+	defer func() { _ = conn1Reconnect.CloseNow() }()
+	_, rawReconSnap, err := conn1Reconnect.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read reconnect snap: %v", err)
+	}
+	reconSnap, _ := codec.Decode(rawReconSnap)
+	if !strings.Contains(string(reconSnap.Data), "workspace: orbit") {
+		t.Fatalf("expected reconnect scrollback to include 'workspace: orbit', got %q", string(reconSnap.Data))
+	}
+
+	// 5. Close tab-2 via DELETE /api/v1/tabs/tab-2 and via CloseTab("").
+	wsSrv.CloseTab("")
+	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, httpSrv.URL+"/api/v1/tabs/tab-2", nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE tab-2: %v", err)
+	}
+	_ = delResp.Body.Close()
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE tab-2 status = %d, want 200", delResp.StatusCode)
+	}
+
+	// 6. POST /api/v1/context and POST /api/v1/snapshot endpoints.
+	ctxPayload, _ := json.Marshal(tui.ContextUpdateRequest{
+		OrbitURL:      "https://orbit.acme.dev",
+		OrbitMCPToken: "omcp_tok_999",
+		WorkspaceSlug: "acme",
+	})
+	ctxResp, err := http.Post(httpSrv.URL+"/api/v1/context", "application/json", bytes.NewReader(ctxPayload))
+	if err != nil {
+		t.Fatalf("POST /api/v1/context: %v", err)
+	}
+	_ = ctxResp.Body.Close()
+	if ctxResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/context status = %d", ctxResp.StatusCode)
+	}
+	mu.Lock()
+	gotOrbitURL := lastCtxReq.OrbitURL
+	mu.Unlock()
+	if gotOrbitURL != "https://orbit.acme.dev" {
+		t.Fatalf("lastCtxReq.OrbitURL = %q, want https://orbit.acme.dev", gotOrbitURL)
+	}
+
+	// Bad JSON and error branch on /api/v1/context
+	badJSONResp, _ := http.Post(httpSrv.URL+"/api/v1/context", "application/json", strings.NewReader("{bad"))
+	_ = badJSONResp.Body.Close()
+	if badJSONResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on bad JSON, got %d", badJSONResp.StatusCode)
+	}
+	errCtxPayload, _ := json.Marshal(tui.ContextUpdateRequest{OrbitURL: "bad"})
+	errCtxResp, _ := http.Post(httpSrv.URL+"/api/v1/context", "application/json", bytes.NewReader(errCtxPayload))
+	_ = errCtxResp.Body.Close()
+	if errCtxResp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on context update error, got %d", errCtxResp.StatusCode)
+	}
+
+	// POST /api/v1/snapshot success and error branch
+	snapResp, err := http.Post(httpSrv.URL+"/api/v1/snapshot", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /api/v1/snapshot: %v", err)
+	}
+	_ = snapResp.Body.Close()
+	if snapResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/snapshot status = %d", snapResp.StatusCode)
+	}
+	snapErrResp, _ := http.Post(httpSrv.URL+"/api/v1/snapshot", "application/json", nil)
+	_ = snapErrResp.Body.Close()
+	if snapErrResp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on second snapshot, got %d", snapErrResp.StatusCode)
+	}
+
+	// Spawner error closes connection cleanly
+	mu.Lock()
+	failSpawn = true
+	mu.Unlock()
+	connFail, _, err := websocket.Dial(ctx, wsBase+"?tab=tab-fail", nil) //nolint:bodyclose
+	if err == nil {
+		_, _, _ = connFail.Read(ctx)
+		_ = connFail.CloseNow()
 	}
 }
