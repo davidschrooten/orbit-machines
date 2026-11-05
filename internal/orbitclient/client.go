@@ -180,5 +180,13 @@ func (f *FakeClient) MintCredentials(_ context.Context, req protocol.MintCredent
 	f.CredentialMints = append(f.CredentialMints, req)
 	return protocol.MintCredentialsResponse{
 		OrbitMCPToken: "omcp_fake_token",
+		Repositories: []protocol.RepoCredential{
+			{
+				ID:            "repo_fake",
+				Name:          "orbit",
+				CloneURL:      "https://github.com/acme/orbit.git",
+				DefaultBranch: "main",
+			},
+		},
 	}, nil
 }

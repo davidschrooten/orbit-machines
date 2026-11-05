@@ -104,6 +104,7 @@ func defaultServeRunner(logOut io.Writer) ServeRunner {
 		)
 
 		srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
+			OrbitURL:          cfg.OrbitURL,
 			ClusterToken:      cfg.ClusterToken,
 			MaxConcurrentPods: cfg.MaxConcurrentPods,
 			TicketCodec:       ticketCodec,

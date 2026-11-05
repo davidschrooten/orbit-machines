@@ -62,7 +62,9 @@ func TestBuildPodManifest_SecurityAndTierSpecs(t *testing.T) {
 				UserEmail:               "alice@example.com",
 				Tier:                    tc.tier,
 				ProfileEncryptionKeyHex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				OrbitURL:                "https://orbit.acme.dev",
 				OrbitMCPToken:           "omcp_tok_123",
+				RepositoriesJSON:        `[{"name":"orbit","clone_url":"https://github.com/acme/orbit.git"}]`,
 			}
 
 			manifest := k8s.BuildPodManifest(cfg, req)
@@ -112,6 +114,22 @@ func TestBuildPodManifest_SecurityAndTierSpecs(t *testing.T) {
 			}
 			if c.SecurityContext.AllowPrivilegeEscalation || len(c.SecurityContext.Capabilities.Drop) != 1 || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
 				t.Fatalf("unexpected container security context: %+v", c.SecurityContext)
+			}
+
+			envMap := make(map[string]string, len(c.Env))
+			for _, e := range c.Env {
+				envMap[e.Name] = e.Value
+			}
+			for k, wantVal := range map[string]string{
+				"ORBIT_URL":               "https://orbit.acme.dev",
+				"ORBIT_MCP_TOKEN":         "omcp_tok_123",
+				"ORBIT_WORKSPACE_SLUG":    "acme",
+				"ORBIT_USER_EMAIL":        "alice@example.com",
+				"ORBIT_REPOSITORIES_JSON": `[{"name":"orbit","clone_url":"https://github.com/acme/orbit.git"}]`,
+			} {
+				if envMap[k] != wantVal {
+					t.Fatalf("container env %s = %q, want %q", k, envMap[k], wantVal)
+				}
 			}
 		})
 	}

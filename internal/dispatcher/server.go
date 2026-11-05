@@ -3,6 +3,7 @@
 package dispatcher
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ import (
 
 // ServerConfig holds dependencies for the dispatcher Server.
 type ServerConfig struct {
+	OrbitURL          string
 	ClusterToken      string
 	MaxConcurrentPods int
 	TicketCodec       *ticket.Codec
@@ -37,6 +40,7 @@ type ServerConfig struct {
 
 // Server is the HTTP/WebSocket session gateway and heartbeat runner.
 type Server struct {
+	orbitURL          string
 	clusterToken      string
 	maxConcurrentPods int
 	ticketCodec       *ticket.Codec
@@ -66,6 +70,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		nowFn = time.Now
 	}
 	return &Server{
+		orbitURL:          strings.TrimRight(strings.TrimSpace(cfg.OrbitURL), "/"),
 		clusterToken:      strings.TrimSpace(cfg.ClusterToken),
 		maxConcurrentPods: maxPods,
 		ticketCodec:       cfg.TicketCodec,
@@ -180,13 +185,23 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	s.registerActiveSession(mid, sessCancel)
 	defer s.unregisterActiveSession(mid)
 
-	var mcpToken string
+	var (
+		mcpToken  string
+		repos     []protocol.RepoCredential
+		reposJSON string
+	)
 	if s.orbitClient != nil {
 		if creds, credErr := s.orbitClient.MintCredentials(sessCtx, protocol.MintCredentialsRequest{
 			WorkspaceID: mid.WorkspaceID(),
 			Subject:     mid.UserID(),
 		}); credErr == nil {
 			mcpToken = creds.OrbitMCPToken
+			repos = creds.Repositories
+			if len(repos) > 0 {
+				if raw, mErr := json.Marshal(repos); mErr == nil {
+					reposJSON = string(raw)
+				}
+			}
 		}
 	}
 
@@ -196,7 +211,9 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		UserEmail:               claims.UserLogin,
 		Tier:                    claims.Tier,
 		ProfileEncryptionKeyHex: s.deriveProfileKeyHex(mid),
+		OrbitURL:                s.orbitURL,
 		OrbitMCPToken:           mcpToken,
+		RepositoriesJSON:        reposJSON,
 	}); err != nil {
 		_ = clientConn.Close(websocket.StatusTryAgainLater, err.Error())
 		return
@@ -218,7 +235,10 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	podConn, err := dialPodWebSocket(sessCtx, ep.WebSocketURL)
+	s.pushPodContext(sessCtx, ep, mid, claims, mcpToken, repos)
+
+	podWSURL := appendTabQuery(ep.WebSocketURL, r.URL.Query().Get("tab"))
+	podConn, err := dialPodWebSocket(sessCtx, podWSURL)
 	if err != nil {
 		_ = clientConn.Close(websocket.StatusBadGateway, "unable to dial pod websocket")
 		return
@@ -227,6 +247,69 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = podConn.CloseNow() }()
 
 	_ = spliceWebSockets(sessCtx, clientConn, podConn)
+}
+
+func appendTabQuery(wsURL, tab string) string {
+	tab = strings.TrimSpace(tab)
+	if tab == "" {
+		return wsURL
+	}
+	sep := "?"
+	if strings.Contains(wsURL, "?") {
+		sep = "&"
+	}
+	return wsURL + sep + "tab=" + url.QueryEscape(tab)
+}
+
+func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid domain.MachineID, claims ticket.Claims, mcpToken string, repos []protocol.RepoCredential) {
+	if ep.PodIP == "" && ep.WebSocketURL == "" {
+		return
+	}
+	if mcpToken == "" && len(repos) == 0 && s.orbitURL == "" {
+		return
+	}
+	targetURL := podContextURL(ep)
+	if targetURL == "" {
+		return
+	}
+	payload := map[string]any{
+		"orbit_url":       s.orbitURL,
+		"orbit_mcp_token": mcpToken,
+		"workspace_id":    mid.WorkspaceID(),
+		"workspace_slug":  claims.WorkspaceSlug,
+		"user_id":         mid.UserID(),
+		"user_email":      claims.UserLogin,
+		"repositories":    repos,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func podContextURL(ep k8s.PodEndpoint) string {
+	if u, err := url.Parse(strings.TrimSpace(ep.WebSocketURL)); err == nil && u.Host != "" {
+		scheme := "http"
+		if u.Scheme == "wss" || u.Scheme == "https" {
+			scheme = "https"
+		}
+		return fmt.Sprintf("%s://%s/api/v1/context", scheme, u.Host)
+	}
+	if strings.TrimSpace(ep.PodIP) != "" {
+		return fmt.Sprintf("http://%s:8080/api/v1/context", strings.TrimSpace(ep.PodIP))
+	}
+	return ""
 }
 
 func (s *Server) deriveProfileKeyHex(mid domain.MachineID) string {
@@ -329,6 +412,9 @@ func pumpWebSocket(ctx context.Context, src, dst *websocket.Conn) error {
 	for {
 		msgType, data, err := src.Read(ctx)
 		if err != nil {
+			if websocket.CloseStatus(err) == 4000 || strings.Contains(err.Error(), "close-tab") {
+				_ = dst.Close(4000, "close-tab")
+			}
 			return err
 		}
 		if err := dst.Write(ctx, msgType, data); err != nil {

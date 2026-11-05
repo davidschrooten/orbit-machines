@@ -46,7 +46,9 @@ type PodRequest struct {
 	UserEmail               string
 	Tier                    domain.ResourceTier
 	ProfileEncryptionKeyHex string
+	OrbitURL                string
 	OrbitMCPToken           string
+	RepositoriesJSON        string
 }
 
 // PodEndpoint contains routing details for an active or provisioning Machine Pod.
@@ -229,8 +231,20 @@ func BuildPodManifest(cfg ManifestConfig, req PodRequest) PodManifest {
 	if req.ProfileEncryptionKeyHex != "" {
 		env = append(env, EnvVar{Name: "ORBIT_MACHINED_PROFILE_ENCRYPTION_KEY", Value: req.ProfileEncryptionKeyHex})
 	}
+	if req.OrbitURL != "" {
+		env = append(env, EnvVar{Name: "ORBIT_URL", Value: req.OrbitURL})
+	}
 	if req.OrbitMCPToken != "" {
 		env = append(env, EnvVar{Name: "ORBIT_MCP_TOKEN", Value: req.OrbitMCPToken})
+	}
+	if req.RepositoriesJSON != "" {
+		env = append(env, EnvVar{Name: "ORBIT_REPOSITORIES_JSON", Value: req.RepositoriesJSON})
+	}
+	if req.WorkspaceSlug != "" {
+		env = append(env, EnvVar{Name: "ORBIT_WORKSPACE_SLUG", Value: req.WorkspaceSlug})
+	}
+	if req.UserEmail != "" {
+		env = append(env, EnvVar{Name: "ORBIT_USER_EMAIL", Value: req.UserEmail})
 	}
 
 	return PodManifest{
