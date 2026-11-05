@@ -124,6 +124,20 @@ func defaultServeRunner(logOut io.Writer) ServeRunner {
 			slog.String("ingress_host", cfg.IngressHost),
 		)
 
+		go func() {
+			if _, regErr := orbitClient.RegisterCluster(ctx, protocol.RegisterClusterRequest{
+				ClusterVersion:      "v" + Version,
+				DispatcherURL:       "https://" + cfg.IngressHost,
+				IngressHost:         cfg.IngressHost,
+				KubernetesNamespace: cfg.KubernetesNamespace,
+				MinIOEnabled:        cfg.S3Endpoint != "",
+				MaxConcurrentPods:   cfg.MaxConcurrentPods,
+			}); regErr != nil {
+				logger.WarnContext(ctx, "initial cluster registration failed", slog.String("error", regErr.Error()))
+			}
+			_ = srv.RunHeartbeatLoop(ctx, cfg.HeartbeatInterval)
+		}()
+
 		errCh := make(chan error, 1)
 		go func() {
 			if serveErr := httpSrv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {

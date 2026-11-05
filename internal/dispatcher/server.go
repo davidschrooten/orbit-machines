@@ -74,10 +74,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}, nil
 }
 
-// Handler returns the http.Handler serving /healthz, /ws/terminal, and /api/v1/sessions/{ws_id}/{sub}.
+// Handler returns the http.Handler serving /healthz, /readyz, /ws/terminal, and /api/v1/sessions/{ws_id}/{sub}.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleHealthz)
 	mux.HandleFunc("GET /ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("DELETE /api/v1/sessions/{ws_id}/{sub}", s.handleDeleteSession)
 	return mux
