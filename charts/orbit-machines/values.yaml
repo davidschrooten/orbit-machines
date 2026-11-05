@@ -21,15 +21,12 @@ dispatcher:
     type: ClusterIP
     port: 8080
   ingress:
-    enabled: false
-    className: "nginx"
+    enabled: true
+    className: ""
     host: "machines.orbit.example.com"
-    annotations:
-      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-      nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    annotations: {}
     tls:
-      enabled: true
+      enabled: false
       secretName: "orbit-machines-tls"
   resources:
     requests:
