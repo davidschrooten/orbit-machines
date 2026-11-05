@@ -18,11 +18,13 @@ RUN mkdir -p /etc/nix \
       /nix/var/nix/gcroots/per-user/orbit \
       /nix/var/nix/temproots && \
     printf "experimental-features = nix-command flakes\nbuild-users-group =\nsandbox = false\nfilter-syscalls = false\n" > /etc/nix/nix.conf && \
-    nix-env -p /nix/var/nix/profiles/orbit -i -f /etc/orbit/configuration.nix && \
-    nix-collect-garbage -d && \
-    ln -sf "$(readlink -f /nix/var/nix/profiles/orbit)" /nix/var/nix/profiles/per-user/orbit/profile-1-link && \
+    nix-env -i -f /etc/orbit/configuration.nix && \
+    export PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH" && \
+    ln -sf "$(readlink -f /root/.nix-profile)" /nix/var/nix/profiles/orbit && \
+    ln -sf "$(readlink -f /root/.nix-profile)" /nix/var/nix/profiles/per-user/orbit/profile-1-link && \
     ln -sf profile-1-link /nix/var/nix/profiles/per-user/orbit/profile && \
     ln -sf /nix/var/nix/profiles/per-user/orbit/profile /home/orbit/.nix-profile && \
+    nix-collect-garbage -d && \
     if [ -e /nix/var/nix/profiles/per-user/root/channels ]; then \
       ln -sf /nix/var/nix/profiles/per-user/root/channels /nix/var/nix/profiles/per-user/orbit/channels && \
       ln -sf /nix/var/nix/profiles/per-user/orbit/channels /home/orbit/.nix-defexpr; \
