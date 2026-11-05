@@ -193,3 +193,62 @@ func TestMachinedCLI_SeedNixCommand(t *testing.T) {
 		t.Fatalf("expected exit code 1 for empty source/target, got %d", code)
 	}
 }
+
+func TestMachinedCLI_SeedNixReadOnlyStorePermissions(t *testing.T) {
+	for _, mode := range []string{"pure-go", "cp"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "pure-go" {
+				t.Setenv("ORBIT_SEED_NIX_PURE_GO", "1")
+			} else {
+				t.Setenv("ORBIT_SEED_NIX_PURE_GO", "")
+			}
+
+			srcDir := filepath.Join(t.TempDir(), "src-nix")
+			dstDir := filepath.Join(t.TempDir(), "dst-nix")
+			t.Cleanup(func() {
+				makeTreeWritable(srcDir)
+				makeTreeWritable(dstDir)
+			})
+
+			srcPkgDir := filepath.Join(srcDir, "store", "abc-pkg")
+			if err := os.MkdirAll(srcPkgDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll srcPkgDir: %v", err)
+			}
+			srcFile := filepath.Join(srcPkgDir, "hello.drv")
+			if err := os.WriteFile(srcFile, []byte("updated-drv-content\n"), 0o444); err != nil {
+				t.Fatalf("WriteFile srcFile: %v", err)
+			}
+			_ = os.Symlink("hello.drv", filepath.Join(srcPkgDir, "hello-link"))
+			if err := os.Chmod(srcPkgDir, 0o555); err != nil {
+				t.Fatalf("Chmod srcPkgDir: %v", err)
+			}
+
+			// Simulate a prior interrupted run leaving 0555 directory and 0444 file in dstDir without .orbit-nix-seeded
+			dstPkgDir := filepath.Join(dstDir, "store", "abc-pkg")
+			if err := os.MkdirAll(dstPkgDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll dstPkgDir: %v", err)
+			}
+			dstFile := filepath.Join(dstPkgDir, "hello.drv")
+			if err := os.WriteFile(dstFile, []byte("stale-drv\n"), 0o444); err != nil {
+				t.Fatalf("WriteFile dstFile: %v", err)
+			}
+			if err := os.Chmod(dstPkgDir, 0o555); err != nil {
+				t.Fatalf("Chmod dstPkgDir: %v", err)
+			}
+
+			var out, errOut bytes.Buffer
+			code := run(context.Background(), []string{"seed-nix", "--source=" + srcDir, "--target=" + dstDir}, &out, &errOut, Runners{})
+			if code != 0 {
+				t.Fatalf("seed-nix(%s) failed: code=%d stderr=%s", mode, code, errOut.String())
+			}
+
+			got, err := os.ReadFile(dstFile)
+			if err != nil {
+				t.Fatalf("ReadFile dstFile: %v", err)
+			}
+			if string(got) != "updated-drv-content\n" {
+				t.Errorf("dstFile content = %q, want updated-drv-content", string(got))
+			}
+		})
+	}
+}

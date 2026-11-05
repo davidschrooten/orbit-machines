@@ -340,11 +340,13 @@ func defaultSeedNixRunner(logOut io.Writer) func(context.Context, string, string
 			}
 		}
 
+		makeTreeWritable(dstDir)
+
 		if info, err := os.Stat(srcDir); err == nil && info.IsDir() {
 			copiedWithCP := false
 			if os.Getenv("ORBIT_SEED_NIX_PURE_GO") == "" {
 				if cpPath, lookErr := exec.LookPath("cp"); lookErr == nil {
-					if runErr := exec.CommandContext(ctx, cpPath, "-a", filepath.Clean(srcDir)+"/.", filepath.Clean(dstDir)+"/").Run(); runErr == nil {
+					if runErr := exec.CommandContext(ctx, cpPath, "-RP", filepath.Clean(srcDir)+"/.", filepath.Clean(dstDir)+"/").Run(); runErr == nil {
 						copiedWithCP = true
 					}
 				}
@@ -354,6 +356,7 @@ func defaultSeedNixRunner(logOut io.Writer) func(context.Context, string, string
 					return err
 				}
 			}
+			makeTreeWritable(dstDir)
 		}
 
 		ensureNixSubdirs(dstDir)
@@ -361,6 +364,24 @@ func defaultSeedNixRunner(logOut io.Writer) func(context.Context, string, string
 		logger.InfoContext(ctx, "seeded nix store volume", slog.String("source", srcDir), slog.String("target", dstDir))
 		return nil
 	}
+}
+
+func makeTreeWritable(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			_ = os.Chmod(path, info.Mode().Perm()|0o700)
+		} else if d.Type().IsRegular() {
+			_ = os.Chmod(path, info.Mode().Perm()|0o600)
+		}
+		return nil
+	})
 }
 
 func ensureNixSubdirs(nixRoot string) {
@@ -371,7 +392,9 @@ func ensureNixSubdirs(nixRoot string) {
 		"var/nix/gcroots/per-user/orbit",
 		"var/nix/temproots",
 	} {
-		_ = os.MkdirAll(filepath.Join(nixRoot, sub), 0o755)
+		target := filepath.Join(nixRoot, sub)
+		_ = os.MkdirAll(target, 0o755)
+		_ = os.Chmod(target, 0o755)
 	}
 }
 
@@ -386,7 +409,11 @@ func copyNixTree(srcRoot, dstRoot string) error {
 		}
 		target := filepath.Join(dstRoot, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			_ = os.Chmod(target, 0o755)
+			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
 			linkDest, linkErr := os.Readlink(path)
@@ -394,6 +421,7 @@ func copyNixTree(srcRoot, dstRoot string) error {
 				return linkErr
 			}
 			_ = os.MkdirAll(filepath.Dir(target), 0o755)
+			_ = os.Chmod(filepath.Dir(target), 0o755)
 			_ = os.Remove(target)
 			return os.Symlink(linkDest, target)
 		}
@@ -404,13 +432,29 @@ func copyNixTree(srcRoot, dstRoot string) error {
 		if err != nil {
 			return err
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		return os.WriteFile(target, data, info.Mode().Perm())
+		_ = os.Chmod(filepath.Dir(target), 0o755)
+		_ = os.Remove(target)
+		return copyRegularFile(path, target, info.Mode().Perm()|0o200)
 	})
+}
+
+func copyRegularFile(srcPath, dstPath string, mode fs.FileMode) error {
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
