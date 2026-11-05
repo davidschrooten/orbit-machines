@@ -388,6 +388,7 @@ pkgs.buildEnv {
     pkg-config
     git
     gh
+    nodejs
     openssh
     htop
     curl
@@ -444,11 +445,21 @@ func EnsureInitialized(homeDir, workDir string) error {
 	}
 
 	configNixPath := filepath.Join(homeDir, ".config", "orbit", "configuration.nix")
-	if _, err := os.Stat(configNixPath); os.IsNotExist(err) {
+	if existingCfgNix, err := os.ReadFile(configNixPath); os.IsNotExist(err) {
 		if err := os.WriteFile(configNixPath, []byte(DefaultConfigurationNix), 0o644); err != nil {
 			return fmt.Errorf("writing configuration.nix: %w", err)
 		}
+	} else if err == nil {
+		content := string(existingCfgNix)
+		if !strings.Contains(content, "nodejs") {
+			if idx := strings.LastIndex(content, "];"); idx >= 0 {
+				upgraded := content[:idx] + "    nodejs\n  " + strings.TrimLeft(content[idx:], " \t")
+				_ = os.WriteFile(configNixPath, []byte(upgraded), 0o644)
+			}
+		}
 	}
+
+	ensurePersistentLocalDir(homeDir, workDir)
 
 	nixProfileLink := filepath.Join(homeDir, ".nix-profile")
 	if _, err := os.Lstat(nixProfileLink); os.IsNotExist(err) {
@@ -523,6 +534,62 @@ func upsertBashrcBlock(existing, block string) string {
 	return updated.String()
 }
 
+func ensurePersistentLocalDir(homeDir, workDir string) {
+	wsLocal := filepath.Join(workDir, ".orbit", "local")
+	_ = os.MkdirAll(filepath.Join(wsLocal, "bin"), 0o755)
+	_ = os.MkdirAll(filepath.Join(wsLocal, "lib"), 0o755)
+
+	homeLocal := filepath.Join(homeDir, ".local")
+	if fi, err := os.Lstat(homeLocal); os.IsNotExist(err) {
+		if symErr := os.Symlink(wsLocal, homeLocal); symErr != nil {
+			_ = os.MkdirAll(filepath.Join(homeLocal, "bin"), 0o755)
+		}
+		return
+	} else if err == nil && fi.Mode()&os.ModeSymlink == 0 && fi.IsDir() {
+		homeLocalBin := filepath.Join(homeLocal, "bin")
+		if entries, readErr := os.ReadDir(homeLocalBin); readErr == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				src := filepath.Join(homeLocalBin, entry.Name())
+				dst := filepath.Join(wsLocal, "bin", entry.Name())
+				if _, statErr := os.Lstat(dst); os.IsNotExist(statErr) {
+					if data, rErr := os.ReadFile(src); rErr == nil {
+						_ = os.WriteFile(dst, data, 0o755)
+					}
+				}
+			}
+		}
+		if entries, readErr := os.ReadDir(homeLocal); readErr == nil && isEffectivelyEmptyLocalDir(homeLocal, entries) {
+			_ = os.RemoveAll(homeLocal)
+			if symErr := os.Symlink(wsLocal, homeLocal); symErr == nil {
+				return
+			}
+		}
+	}
+	_ = os.MkdirAll(filepath.Join(homeLocal, "bin"), 0o755)
+}
+
+func isEffectivelyEmptyLocalDir(homeLocal string, entries []os.DirEntry) bool {
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != "bin" && name != "lib" {
+			return false
+		}
+		subEntries, err := os.ReadDir(filepath.Join(homeLocal, name))
+		if err != nil {
+			return false
+		}
+		for _, sub := range subEntries {
+			if sub.IsDir() {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func buildDirenvTOML(workDir string) string {
 	const defaultWorkspace = "/home/orbit/workspace"
 	return fmt.Sprintf("[whitelist]\nprefix = [ %q, %q ]\n", defaultWorkspace, filepath.Clean(workDir))
@@ -535,7 +602,8 @@ func buildBashrcBlock(homeDir string) string {
 	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
 	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	return fmt.Sprintf(`%s
-export PATH="%s/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/usr/local/bin:$PATH"
+export NPM_CONFIG_PREFIX="%s/.local"
+export PATH="%s/.local/bin:%s/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/usr/local/bin:$PATH"
 export STARSHIP_CONFIG=%q
 export COLORTERM="truecolor"
 export TERM="${TERM:-xterm-256color}"
@@ -550,13 +618,14 @@ if [[ $- == *i* ]]; then
   printf '  \033[1;33morbit\033[0m                    Launch interactive Orbit workspace & tool assistant\n'
   printf '  \033[1;33morbit repos\033[0m              Fetch & clone workspace repositories\n'
   printf '  \033[1;33morbit flake init [stack]\033[0m Initialize Nix flake + direnv .envrc\n'
+  printf '  \033[1;33morbit packages\033[0m           Search nixpkgs, install, or uninstall system packages\n'
   printf '  \033[1;33morbit rebuild\033[0m            Apply ~/.config/orbit/configuration.nix packages\n'
-  printf '  \033[1;33morbit tools [tool...]\033[0m    Configure AI coding tools (claude, codex, gemini, opencode, cursor, aider)\n'
+  printf '  \033[1;33morbit tools [tool...]\033[0m    Install & configure AI coding tools (claude, agy, opencode, codex, gemini)\n'
   printf '  \033[1;33morbit git\033[0m                Configure Git author identity & defaults\n'
   printf '  \033[1;33morbit ssh-key\033[0m            Generate or import your Git SSH key\n'
   printf '  \033[1;33morbit status\033[0m             Show configured tools, Git, SSH key, and workspace status\n'
   printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n\n'
 fi
 %s
-`, bashrcMarkerStart, homeDir, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
+`, bashrcMarkerStart, homeDir, homeDir, homeDir, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
 }

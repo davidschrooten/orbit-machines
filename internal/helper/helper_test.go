@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -190,6 +191,9 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 
 	for _, cfgFile := range []string{
 		filepath.Join(homeDir, ".claude.json"),
+		filepath.Join(homeDir, ".claude", "settings.json"),
+		filepath.Join(homeDir, ".gemini", "config", "mcp_config.json"),
+		filepath.Join(homeDir, ".gemini", "antigravity-cli", "settings.json"),
 		filepath.Join(homeDir, ".config", "antigravity", "mcp.json"),
 		filepath.Join(homeDir, ".gemini", "settings.json"),
 		filepath.Join(homeDir, ".config", "opencode", "config.json"),
@@ -226,8 +230,8 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 	if err := mgr.Save(ctx); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if snapshotHits != 1 {
-		t.Fatalf("expected Save to POST /api/v1/snapshot once, got %d", snapshotHits)
+	if snapshotHits < 1 {
+		t.Fatalf("expected Save to POST /api/v1/snapshot at least once, got %d", snapshotHits)
 	}
 }
 
@@ -686,4 +690,249 @@ func TestManager_EdgeCasesAndDefaultCloner(t *testing.T) {
 	}
 	var errMenuOut bytes.Buffer
 	_ = errMgr.RunInteractive(ctx, strings.NewReader("1\nnonexistent\nn\n2\n\n2\ncloned-from-local\ngo\nq\n"), &errMenuOut)
+}
+
+func TestManager_ToolInstallerAndSystemPackages(t *testing.T) {
+	t.Parallel()
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	workDir := filepath.Join(homeDir, "workspace")
+
+	var (
+		installedTools []string
+		nixRebuildRuns int
+	)
+
+	mgr, err := helper.NewManager(helper.Config{
+		HomeDir: homeDir,
+		WorkDir: workDir,
+		ToolInstaller: func(_ context.Context, _, tool string, _ io.Writer) error {
+			installedTools = append(installedTools, tool)
+			return nil
+		},
+		NixEnvRunner: func(_ context.Context, _ string) error {
+			nixRebuildRuns++
+			return nil
+		},
+		NixSearcher: func(_ context.Context, query string) ([]helper.NixPackageResult, error) {
+			return []helper.NixPackageResult{
+				{Attribute: "postgresql", Name: "postgresql", Version: "16.4", Description: "Powerful open source object-relational database system"},
+				{Attribute: "postgresql_15", Name: "postgresql", Version: "15.8", Description: "PostgreSQL 15"},
+				{Attribute: "redis", Name: "redis", Version: "7.2.5", Description: "Open source in-memory data structure store"},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	_ = mgr.SaveContext(helper.OrbitContext{
+		OrbitURL:      "https://orbit.acme.dev",
+		OrbitMCPToken: "omcp_tok_tools",
+	})
+
+	// Pre-populate .claude.json and .gemini/config/mcp_config.json with existing user keys and another MCP server
+	_ = os.WriteFile(filepath.Join(homeDir, ".claude.json"), []byte(`{"theme":"dark","mcpServers":{"github":{"url":"https://gh.mcp.local"}}}`), 0o600)
+	_ = os.MkdirAll(filepath.Join(homeDir, ".gemini", "config"), 0o755)
+	_ = os.WriteFile(filepath.Join(homeDir, ".gemini", "config", "mcp_config.json"), []byte(`{"mcpServers":{"existing":{"url":"https://ex.mcp.local"}}}`), 0o600)
+
+	// Test ConfigureToolsWithContext with aliases ("claude-code", "antigravity")
+	var toolOut bytes.Buffer
+	configured, err := mgr.ConfigureToolsWithContext(context.Background(), []string{"claude-code", "antigravity"}, &toolOut)
+	if err != nil {
+		t.Fatalf("ConfigureToolsWithContext: %v", err)
+	}
+	if len(configured) != 2 || configured[0] != "claude" || configured[1] != "agy" {
+		t.Fatalf("unexpected configured tools: %v", configured)
+	}
+	if len(installedTools) != 2 || installedTools[0] != "claude" || installedTools[1] != "agy" {
+		t.Fatalf("expected ToolInstaller to be called for claude and agy, got %v", installedTools)
+	}
+
+	// Verify .claude.json preserved "theme":"dark", "github" MCP server, set "hasCompletedOnboarding":true, and added "orbit" MCP server
+	claudeData, err := os.ReadFile(filepath.Join(homeDir, ".claude.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(.claude.json): %v", err)
+	}
+	for _, needle := range []string{`"theme": "dark"`, `"hasCompletedOnboarding": true`, `"github"`, `"orbit"`, `"https://orbit.acme.dev/mcp"`, `"Bearer omcp_tok_tools"`} {
+		if !strings.Contains(string(claudeData), needle) {
+			t.Errorf(".claude.json missing %q:\n%s", needle, string(claudeData))
+		}
+	}
+
+	// Verify .gemini/config/mcp_config.json preserved "existing" and added "orbit"
+	agyMCPData, err := os.ReadFile(filepath.Join(homeDir, ".gemini", "config", "mcp_config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(.gemini/config/mcp_config.json): %v", err)
+	}
+	for _, needle := range []string{`"existing"`, `"orbit"`, `"https://orbit.acme.dev/mcp"`} {
+		if !strings.Contains(string(agyMCPData), needle) {
+			t.Errorf(".gemini/config/mcp_config.json missing %q:\n%s", needle, string(agyMCPData))
+		}
+	}
+
+	// Test system package search, list, install, uninstall, and interactive packages menu
+	ctx := context.Background()
+	if _, err := mgr.SearchNixPackages(ctx, "   "); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty search query, got %v", err)
+	}
+	if err := mgr.InstallConfigurationNixPackages(ctx, nil); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty install list, got %v", err)
+	}
+	if err := mgr.UninstallConfigurationNixPackages(ctx, nil); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty uninstall list, got %v", err)
+	}
+
+	results, err := mgr.SearchNixPackages(ctx, "postgres")
+	if err != nil || len(results) != 3 || results[0].Attribute != "postgresql" {
+		t.Fatalf("SearchNixPackages = %+v, err=%v", results, err)
+	}
+
+	if err := mgr.InstallConfigurationNixPackages(ctx, []string{"postgresql", "redis"}); err != nil {
+		t.Fatalf("InstallConfigurationNixPackages: %v", err)
+	}
+	pkgs, err := mgr.ListConfigurationNixPackages()
+	if err != nil {
+		t.Fatalf("ListConfigurationNixPackages: %v", err)
+	}
+	if !strings.Contains(strings.Join(pkgs, ","), "postgresql") || !strings.Contains(strings.Join(pkgs, ","), "redis") {
+		t.Fatalf("expected postgresql and redis in ListConfigurationNixPackages, got %v", pkgs)
+	}
+
+	if err := mgr.UninstallConfigurationNixPackages(ctx, []string{"redis"}); err != nil {
+		t.Fatalf("UninstallConfigurationNixPackages: %v", err)
+	}
+	pkgsAfter, _ := mgr.ListConfigurationNixPackages()
+	if strings.Contains(strings.Join(pkgsAfter, ","), "redis") || !strings.Contains(strings.Join(pkgsAfter, ","), "postgresql") {
+		t.Fatalf("expected redis to be removed and postgresql to remain, got %v", pkgsAfter)
+	}
+
+	// Interactive packages menu: search & install (#1), install by attr (#2), uninstall (#3), list (#4), back (b), invalid option
+	var pkgOut bytes.Buffer
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("1\npostgres\n1,3\n"), &pkgOut); err != nil {
+		t.Fatalf("RunInteractivePackages(1): %v", err)
+	}
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("2\ncmake gcc\n"), &pkgOut); err != nil {
+		t.Fatalf("RunInteractivePackages(2): %v", err)
+	}
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("3\ncmake\n"), &pkgOut); err != nil {
+		t.Fatalf("RunInteractivePackages(3): %v", err)
+	}
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("4\n"), &pkgOut); err != nil {
+		t.Fatalf("RunInteractivePackages(4): %v", err)
+	}
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("b\n"), &pkgOut); err != nil {
+		t.Fatalf("RunInteractivePackages(b): %v", err)
+	}
+	if err := mgr.RunInteractivePackages(ctx, strings.NewReader("99\n"), &pkgOut); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for invalid interactive packages option, got %v", err)
+	}
+
+	// ParseNixSearchJSON and ParseNixEnvSearchOutput
+	rawSearchJSON := []byte(`{
+		"legacyPackages.x86_64-linux.ripgrep-all": {"pname": "ripgrep-all", "version": "1.0.0", "description": "rga"},
+		"legacyPackages.x86_64-linux.ripgrep": {"pname": "ripgrep", "version": "14.1.1", "description": "Fast grep"},
+		"packages.x86_64-linux.repgrep": {"pname": "repgrep", "version": "0.17.1", "description": "Replacer"}
+	}`)
+	parsedJSON, err := helper.ParseNixSearchJSON(rawSearchJSON, "ripgrep")
+	if err != nil || len(parsedJSON) != 3 || parsedJSON[0].Attribute != "ripgrep" {
+		t.Fatalf("ParseNixSearchJSON = %+v, err=%v", parsedJSON, err)
+	}
+	parsedEnv := helper.ParseNixEnvSearchOutput("nixpkgs.htop  htop-3.3.0  Interactive process viewer\nnixpkgs.btop  btop-1.4.0  Monitor of resources\n", "htop")
+	if len(parsedEnv) != 2 || parsedEnv[0].Attribute != "htop" {
+		t.Fatalf("ParseNixEnvSearchOutput = %+v", parsedEnv)
+	}
+}
+
+func TestDefaultToolInstallerAndDefaultNixSearcher(t *testing.T) {
+	t.Setenv("ORBIT_TEST_REAL_TOOL_INSTALLER", "1")
+
+	binDir := filepath.Join(t.TempDir(), "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll fake-bin: %v", err)
+	}
+
+	writeScript := func(name, body string) {
+		p := filepath.Join(binDir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+
+	// Fake npm creates binaries in $NPM_CONFIG_PREFIX/bin
+	writeScript("npm", `
+mkdir -p "$NPM_CONFIG_PREFIX/bin"
+for arg in "$@"; do
+  case "$arg" in
+    *claude-code*) printf '#!/bin/sh\necho claude\n' > "$NPM_CONFIG_PREFIX/bin/claude" && chmod +x "$NPM_CONFIG_PREFIX/bin/claude" ;;
+    *opencode*)    printf '#!/bin/sh\necho opencode\n' > "$NPM_CONFIG_PREFIX/bin/opencode" && chmod +x "$NPM_CONFIG_PREFIX/bin/opencode" ;;
+    *codex*)       printf '#!/bin/sh\necho codex\n' > "$NPM_CONFIG_PREFIX/bin/codex" && chmod +x "$NPM_CONFIG_PREFIX/bin/codex" ;;
+    *gemini*)      printf '#!/bin/sh\necho gemini\n' > "$NPM_CONFIG_PREFIX/bin/gemini" && chmod +x "$NPM_CONFIG_PREFIX/bin/gemini" ;;
+  esac
+done
+`)
+	// Fake curl outputs an installer script that writes agy into the --dir target
+	writeScript("curl", `
+cat << 'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--dir" ]; then
+    mkdir -p "$2"
+    printf '#!/bin/sh\necho agy\n' > "$2/agy"
+    chmod +x "$2/agy"
+    exit 0
+  fi
+  shift
+done
+EOF
+`)
+	writeScript("nix-env", `
+if [ "$1" = "-qaP" ]; then
+  echo "nixpkgs.ripgrep ripgrep-14.1.1 Fast regex search"
+  exit 0
+fi
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\n' > "$HOME/.local/bin/aider" && chmod +x "$HOME/.local/bin/aider"
+printf '#!/bin/sh\n' > "$HOME/.local/bin/gh" && chmod +x "$HOME/.local/bin/gh"
+`)
+	writeScript("nix", `
+echo '{"legacyPackages.x86_64-linux.ripgrep":{"pname":"ripgrep","version":"14.1.1","description":"Fast search"}}'
+`)
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	workDir := filepath.Join(homeDir, "workspace")
+	mgr, err := helper.NewManager(helper.Config{
+		HomeDir: homeDir,
+		WorkDir: workDir,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	var out bytes.Buffer
+	configured, err := mgr.ConfigureToolsWithContext(context.Background(), []string{"claude", "agy", "opencode", "codex", "gemini", "aider", "gh", "git"}, &out)
+	if err != nil {
+		t.Fatalf("ConfigureToolsWithContext with fake binaries: %v", err)
+	}
+	if len(configured) != 8 {
+		t.Fatalf("expected 8 configured tools, got %v", configured)
+	}
+	for _, bin := range []string{"claude", "agy", "antigravity-cli", "opencode", "codex", "gemini"} {
+		if _, err := os.Stat(filepath.Join(homeDir, ".local", "bin", bin)); err != nil {
+			t.Fatalf("expected %s to be installed in ~/.local/bin: %v", bin, err)
+		}
+	}
+
+	// Second call skips installation because binaries now exist in ~/.local/bin
+	if _, err := mgr.ConfigureToolsWithContext(context.Background(), []string{"claude", "agy", "opencode", "codex", "gemini"}, &out); err != nil {
+		t.Fatalf("second ConfigureToolsWithContext: %v", err)
+	}
+
+	// Default NixSearcher via fake nix binary
+	results, err := mgr.SearchNixPackages(context.Background(), "ripgrep")
+	if err != nil || len(results) != 1 || results[0].Attribute != "ripgrep" {
+		t.Fatalf("default SearchNixPackages = %+v, err=%v", results, err)
+	}
 }

@@ -47,7 +47,11 @@ var DefaultProfileWhitelist = []string{
 	".claude",
 	".claude.json",
 	".config/opencode",
+	".codex",
+	".cursor",
+	".aider.conf.yml",
 	".gemini",
+	".local/bin",
 }
 
 // ObjectStore abstracts S3/MinIO bucket operations.

@@ -25,6 +25,11 @@ RUN mkdir -p /etc/nix \
     nix-env --remove-all -i -f /etc/orbit/configuration.nix && \
     export PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH" && \
     nix-collect-garbage -d && \
+    mkdir -p /lib64 /lib /home/orbit/.local/bin && \
+    GLIBC_LD=$(find /nix/store -name "ld-linux-x86-64.so.2" 2>/dev/null | head -n 1) && \
+    if [ -n "$GLIBC_LD" ]; then ln -sf "$GLIBC_LD" /lib64/ld-linux-x86-64.so.2 && ln -sf "$GLIBC_LD" /lib/ld-linux-x86-64.so.2; fi && \
+    GLIBC_LD_ARM=$(find /nix/store -name "ld-linux-aarch64.so.1" 2>/dev/null | head -n 1) && \
+    if [ -n "$GLIBC_LD_ARM" ]; then ln -sf "$GLIBC_LD_ARM" /lib/ld-linux-aarch64.so.1; fi && \
     ln -sf "$(readlink -f /root/.nix-profile)" /nix/var/nix/profiles/orbit && \
     ln -sf "$(readlink -f /root/.nix-profile)" /nix/var/nix/profiles/per-user/orbit/profile-1-link && \
     ln -sf profile-1-link /nix/var/nix/profiles/per-user/orbit/profile && \
@@ -53,7 +58,8 @@ RUN ln -sf /usr/local/bin/orbit-helper /usr/local/bin/orbit && \
 ENV HOME=/home/orbit \
     USER=orbit \
     SHELL=/bin/bash \
-    PATH=/home/orbit/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin \
+    NPM_CONFIG_PREFIX=/home/orbit/.local \
+    PATH=/home/orbit/.local/bin:/home/orbit/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin \
     NIX_PATH=nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs:/nix/var/nix/profiles/per-user/root/channels \
     SSL_CERT_FILE=/nix/var/nix/profiles/orbit/etc/ssl/certs/ca-bundle.crt \
     NIX_SSL_CERT_FILE=/nix/var/nix/profiles/orbit/etc/ssl/certs/ca-bundle.crt \

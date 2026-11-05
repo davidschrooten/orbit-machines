@@ -23,6 +23,7 @@ pkgs.buildEnv {
     pkg-config
     git
     gh
+    nodejs
     openssh
     htop
     curl
