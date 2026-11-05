@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -119,8 +120,8 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(env.sh): %v", err)
 	}
-	if !strings.Contains(string(envBytes), `export ORBIT_MCP_TOKEN="omcp_secret_123"`) {
-		t.Fatalf("env.sh missing ORBIT_MCP_TOKEN:\n%s", string(envBytes))
+	if !strings.Contains(string(envBytes), `export ORBIT_MCP_TOKEN="omcp_secret_123"`) || !strings.Contains(string(envBytes), "export GIT_TERMINAL_PROMPT=0") || !strings.Contains(string(envBytes), "export GIT_SSH_COMMAND=") {
+		t.Fatalf("env.sh missing expected exports:\n%s", string(envBytes))
 	}
 
 	// 2. CloneRepositories with cloneAll=true and initMissingFlake=true
@@ -135,9 +136,9 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 	if len(cloned) != 2 {
 		t.Fatalf("expected 2 cloned repos, got %v", cloned)
 	}
-	// Verify authenticated URL was constructed for repo_1
-	if !strings.Contains(clonedURLs[0], "x-access-token:ghs_tok123@github.com/acme/orbit.git") {
-		t.Fatalf("expected authenticated clone URL, got %q", clonedURLs[0])
+	// Verify SSH clone URLs were constructed for both repos (never HTTPS)
+	if clonedURLs[0] != "git@github.com:acme/orbit.git" || clonedURLs[1] != "git@github.com:acme/billing.git" {
+		t.Fatalf("expected SSH clone URLs, got %v", clonedURLs)
 	}
 	// Verify both repos have .envrc with "use flake" and billing had flake.nix generated
 	for _, repoName := range []string{"orbit", "billing"} {
@@ -202,10 +203,14 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 		}
 	}
 
-	// Verify .claude.json contains the Orbit MCP URL and Bearer token
+	// Verify .claude.json contains the Orbit MCP URL and Bearer token, and gh config uses ssh protocol
 	claudeBytes, _ := os.ReadFile(filepath.Join(homeDir, ".claude.json"))
 	if !strings.Contains(string(claudeBytes), "https://orbit.acme.dev/mcp") || !strings.Contains(string(claudeBytes), "Bearer omcp_secret_123") {
 		t.Fatalf("unexpected .claude.json:\n%s", string(claudeBytes))
+	}
+	ghBytes, _ := os.ReadFile(filepath.Join(homeDir, ".config", "gh", "config.yml"))
+	if !strings.Contains(string(ghBytes), "git_protocol: ssh") {
+		t.Fatalf("expected gh config.yml to use git_protocol: ssh, got:\n%s", string(ghBytes))
 	}
 
 	// 5. Status & Save
@@ -245,10 +250,37 @@ func TestManager_GitAndSSHKeyPersistenceAndRestoration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(.gitconfig): %v", err)
 	}
-	for _, needle := range []string{"defaultBranch = main", "rebase = false", "directory = *"} {
+	for _, needle := range []string{"# orbit-git-ssh: v1", "defaultBranch = main", "rebase = false", "directory = *", "sshCommand = ssh -i ", "insteadOf = https://github.com/"} {
 		if !strings.Contains(string(initialGitCfg), needle) {
 			t.Fatalf(".gitconfig missing %q:\n%s", needle, string(initialGitCfg))
 		}
+	}
+
+	// Verify legacy .gitconfig without # orbit-git-ssh: v1 gets upgraded by EnsureGitAndSSH
+	_ = os.WriteFile(filepath.Join(homeDir, ".gitconfig"), []byte("[user]\n\tname = Legacy\n[credential]\n\thelper = store\n"), 0o644)
+	if err := mgr.EnsureGitAndSSH(); err != nil {
+		t.Fatalf("EnsureGitAndSSH upgrade: %v", err)
+	}
+	upgradedGitCfg, _ := os.ReadFile(filepath.Join(homeDir, ".gitconfig"))
+	if !strings.Contains(string(upgradedGitCfg), "# orbit-git-ssh: v1") || !strings.Contains(string(upgradedGitCfg), "sshCommand = ssh -i ") {
+		t.Fatalf("expected legacy .gitconfig to be upgraded to SSH config, got:\n%s", string(upgradedGitCfg))
+	}
+
+	// Verify ToSSHCloneURL conversions
+	if got := helper.ToSSHCloneURL("https://github.com/acme/orbit"); got != "git@github.com:acme/orbit.git" {
+		t.Fatalf("ToSSHCloneURL(https without .git) = %q", got)
+	}
+	if got := helper.ToSSHCloneURL("http://gitlab.com/acme/repo.git"); got != "git@gitlab.com:acme/repo.git" {
+		t.Fatalf("ToSSHCloneURL(http gitlab) = %q", got)
+	}
+	if got := helper.ToSSHCloneURL("http://127.0.0.1:8080/repo.git"); got != "http://127.0.0.1:8080/repo.git" {
+		t.Fatalf("ToSSHCloneURL(localhost) = %q", got)
+	}
+	if got := helper.ToSSHCloneURL("https://github.com/"); got != "https://github.com/" {
+		t.Fatalf("ToSSHCloneURL(empty path) = %q", got)
+	}
+	if got := helper.ToSSHCloneURL("git@github.com:acme/orbit.git"); got != "git@github.com:acme/orbit.git" {
+		t.Fatalf("ToSSHCloneURL(ssh) = %q", got)
 	}
 
 	// 2. ConfigureGit validation and persistence
@@ -333,6 +365,15 @@ func TestManager_GitAndSSHKeyPersistenceAndRestoration(t *testing.T) {
 	pkcs8PEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8DER}))
 	if _, err := mgr.SetSSHKey(pkcs8PEM); err != nil {
 		t.Fatalf("SetSSHKey(PKCS#8 PEM): %v", err)
+	}
+
+	if _, lookErr := exec.LookPath("ssh-keygen"); lookErr == nil {
+		rsaPriv, _ := rsa.GenerateKey(rand.Reader, 2048)
+		rsaDER := x509.MarshalPKCS1PrivateKey(rsaPriv)
+		rsaPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: rsaDER}))
+		if rsaCfg, err := mgr.SetSSHKey(rsaPEM); err != nil || !strings.HasPrefix(rsaCfg.PublicKey, "ssh-rsa ") {
+			t.Fatalf("SetSSHKey(RSA PEM) = (%q, %v)", rsaCfg.PublicKey, err)
+		}
 	}
 
 	// 7. Additional AI tools in ConfigureTools (gemini, codex, cursor, aider) + stack name in InitFlake

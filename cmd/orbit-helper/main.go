@@ -128,7 +128,7 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "🪐 Orbit Workspace Repositories:")
 				for _, r := range orbitCtx.Repositories {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  • %s (%s)\n", r.Name, r.CloneURL)
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  • %s (%s)\n", r.Name, helper.ToSSHCloneURL(r.CloneURL))
 				}
 				return nil
 			}
