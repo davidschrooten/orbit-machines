@@ -153,6 +153,43 @@ func TestFrameCodec_RoundTrips(t *testing.T) {
 			t.Errorf("decoded metadata = %+v, want %+v", dec.Metadata, meta)
 		}
 	})
+
+	t.Run("0x04 FrameFileUpload encode and decode", func(t *testing.T) {
+		t.Parallel()
+		content := []byte("package main\nfunc main() {}\n")
+		wire, err := codec.EncodeUploadFrame("main.go", content)
+		if err != nil {
+			t.Fatalf("EncodeUploadFrame error: %v", err)
+		}
+		if wire[0] != byte(protocol.FrameFileUpload) {
+			t.Fatalf("header = 0x%02x, want 0x04", wire[0])
+		}
+		dec, err := codec.Decode(wire)
+		if err != nil {
+			t.Fatalf("Decode upload frame error: %v", err)
+		}
+		if dec.Type != protocol.FrameFileUpload {
+			t.Fatalf("decoded type = 0x%02x, want 0x04", dec.Type)
+		}
+		name, data, err := protocol.DecodeUploadPayload(dec.Data)
+		if err != nil {
+			t.Fatalf("DecodeUploadPayload(dec.Data) error: %v", err)
+		}
+		if name != "main.go" || !bytes.Equal(data, content) {
+			t.Fatalf("got (%q, %q), want (\"main.go\", %q)", name, data, content)
+		}
+
+		// Also test DecodeUploadPayload directly with the 0x04 header prefix and unpadded base64
+		name2, data2, err := protocol.DecodeUploadPayload(wire)
+		if err != nil || name2 != "main.go" || !bytes.Equal(data2, content) {
+			t.Fatalf("DecodeUploadPayload(wire) = (%q, %q, %v)", name2, data2, err)
+		}
+		unpadded := []byte(`{"name":"notes.txt","data":"aGVsbG8"}`)
+		name3, data3, err := protocol.DecodeUploadPayload(unpadded)
+		if err != nil || name3 != "notes.txt" || string(data3) != "hello" {
+			t.Fatalf("DecodeUploadPayload(unpadded) = (%q, %q, %v)", name3, data3, err)
+		}
+	})
 }
 
 func TestFrameCodec_ValidationAndErrors(t *testing.T) {
@@ -181,6 +218,24 @@ func TestFrameCodec_ValidationAndErrors(t *testing.T) {
 	}
 	if _, err := smallCodec.EncodeDiff(bytes.Repeat([]byte("a"), 64)); !errors.Is(err, domain.ErrFrameTooLarge) {
 		t.Errorf("EncodeDiff oversized err = %v, want ErrFrameTooLarge", err)
+	}
+	if _, err := smallCodec.EncodeUploadFrame("big.bin", bytes.Repeat([]byte("a"), 64)); !errors.Is(err, domain.ErrFrameTooLarge) {
+		t.Errorf("EncodeUploadFrame oversized err = %v, want ErrFrameTooLarge", err)
+	}
+	if _, err := smallCodec.EncodeUploadFrame("", []byte("x")); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Errorf("EncodeUploadFrame empty name err = %v, want ErrInvalidConfig", err)
+	}
+	if _, _, err := protocol.DecodeUploadPayload(nil); !errors.Is(err, domain.ErrFrameEmpty) {
+		t.Errorf("DecodeUploadPayload(nil) err = %v, want ErrFrameEmpty", err)
+	}
+	if _, _, err := protocol.DecodeUploadPayload([]byte("{bad")); !errors.Is(err, protocol.ErrCorruptMetadataJSON) {
+		t.Errorf("DecodeUploadPayload(bad json) err = %v, want ErrCorruptMetadataJSON", err)
+	}
+	if _, _, err := protocol.DecodeUploadPayload([]byte(`{"name":"","data":"YQ=="}`)); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Errorf("DecodeUploadPayload(empty name) err = %v, want ErrInvalidConfig", err)
+	}
+	if _, _, err := protocol.DecodeUploadPayload([]byte(`{"name":"a.txt","data":"!!!not-base64!!!"}`)); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Errorf("DecodeUploadPayload(bad base64) err = %v, want ErrInvalidConfig", err)
 	}
 
 	// Build a zstd bomb that compresses to <32 bytes on wire but expands >32 bytes on decode

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,11 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/domain"
 	"github.com/davidschrooten/orbit-machines/internal/protocol"
 	"github.com/davidschrooten/orbit-machines/internal/pty"
+)
+
+const (
+	defaultWSReadLimit       = 64 << 20 // 64 MiB
+	defaultKeepaliveInterval = 20 * time.Second
 )
 
 // ShellSpawnerFunc spawns an interactive PTY shell pane for the given tab ID.
@@ -32,38 +40,65 @@ type ContextUpdateRequest struct {
 
 // WSServerConfig configures the in-Pod WebSocket server (:8080/ws).
 type WSServerConfig struct {
-	Compositor      *Compositor
-	ShellSpawner    ShellSpawnerFunc
-	TickInterval    time.Duration // Defaults to 16ms (~60fps)
-	OnActivity      func()
-	OnContextUpdate func(req ContextUpdateRequest) error
-	OnSnapshot      func(ctx context.Context) ([]string, error)
+	Compositor        *Compositor
+	ShellSpawner      ShellSpawnerFunc
+	WorkspaceDir      string
+	TickInterval      time.Duration // Defaults to 16ms (~60fps)
+	KeepaliveInterval time.Duration // Defaults to 20s
+	OnActivity        func()
+	OnContextUpdate   func(req ContextUpdateRequest) error
+	OnSnapshot        func(ctx context.Context) ([]string, error)
+}
+
+// WSServerOption configures a WSServer.
+type WSServerOption func(*WSServer)
+
+// WithWorkspaceDir overrides the target directory where uploaded files are written.
+func WithWorkspaceDir(dir string) WSServerOption {
+	return func(s *WSServer) {
+		if trimmed := strings.TrimSpace(dir); trimmed != "" {
+			s.workspaceDir = trimmed
+		}
+	}
+}
+
+type wsClient struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (c *wsClient) WriteBinary(ctx context.Context, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Write(ctx, websocket.MessageBinary, data)
 }
 
 type tabSession struct {
 	id    string
 	pane  *pty.Pane
 	mu    sync.Mutex
-	conns map[*websocket.Conn]struct{}
+	conns map[*wsClient]struct{}
 }
 
 // WSServer streams zstd-compressed terminal frames over binary WebSockets.
 type WSServer struct {
-	comp            *Compositor
-	shellSpawner    ShellSpawnerFunc
-	codec           *protocol.FrameCodec
-	tickInterval    time.Duration
-	onActivity      func()
-	onContextUpdate func(req ContextUpdateRequest) error
-	onSnapshot      func(ctx context.Context) ([]string, error)
+	comp              *Compositor
+	shellSpawner      ShellSpawnerFunc
+	workspaceDir      string
+	codec             *protocol.FrameCodec
+	tickInterval      time.Duration
+	keepaliveInterval time.Duration
+	onActivity        func()
+	onContextUpdate   func(req ContextUpdateRequest) error
+	onSnapshot        func(ctx context.Context) ([]string, error)
 
 	mu      sync.Mutex
-	clients map[*websocket.Conn]struct{}
+	clients map[*wsClient]struct{}
 	tabs    map[string]*tabSession
 }
 
 // NewWSServer validates cfg and constructs a WSServer.
-func NewWSServer(cfg WSServerConfig) (*WSServer, error) {
+func NewWSServer(cfg WSServerConfig, opts ...WSServerOption) (*WSServer, error) {
 	if cfg.Compositor == nil && cfg.ShellSpawner == nil {
 		return nil, fmt.Errorf("%w: Compositor or ShellSpawner is required", domain.ErrInvalidConfig)
 	}
@@ -72,21 +107,43 @@ func NewWSServer(cfg WSServerConfig) (*WSServer, error) {
 	if tick <= 0 {
 		tick = 16 * time.Millisecond
 	}
-	return &WSServer{
-		comp:            cfg.Compositor,
-		shellSpawner:    cfg.ShellSpawner,
-		codec:           codec,
-		tickInterval:    tick,
-		onActivity:      cfg.OnActivity,
-		onContextUpdate: cfg.OnContextUpdate,
-		onSnapshot:      cfg.OnSnapshot,
-		clients:         make(map[*websocket.Conn]struct{}),
-		tabs:            make(map[string]*tabSession),
-	}, nil
+	keepalive := cfg.KeepaliveInterval
+	if keepalive <= 0 {
+		keepalive = defaultKeepaliveInterval
+	}
+	wsDir := strings.TrimSpace(cfg.WorkspaceDir)
+	if wsDir == "" {
+		if envWork := strings.TrimSpace(os.Getenv("ORBIT_MACHINED_WORK_DIR")); envWork != "" {
+			wsDir = envWork
+		} else if envHome := strings.TrimSpace(os.Getenv("HOME")); envHome != "" {
+			wsDir = filepath.Join(envHome, "workspace")
+		} else {
+			wsDir = "/home/orbit/workspace"
+		}
+	}
+	srv := &WSServer{
+		comp:              cfg.Compositor,
+		shellSpawner:      cfg.ShellSpawner,
+		workspaceDir:      wsDir,
+		codec:             codec,
+		tickInterval:      tick,
+		keepaliveInterval: keepalive,
+		onActivity:        cfg.OnActivity,
+		onContextUpdate:   cfg.OnContextUpdate,
+		onSnapshot:        cfg.OnSnapshot,
+		clients:           make(map[*wsClient]struct{}),
+		tabs:              make(map[string]*tabSession),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(srv)
+		}
+	}
+	return srv, nil
 }
 
 // Handler returns the HTTP handler serving GET /healthz, GET /ws, DELETE /api/v1/tabs/{tab_id},
-// POST /api/v1/context, and POST /api/v1/snapshot.
+// POST /api/v1/context, POST /api/v1/snapshot, and POST /api/v1/upload.
 func (s *WSServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -94,6 +151,7 @@ func (s *WSServer) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/tabs/{tab_id}", s.handleDeleteTab)
 	mux.HandleFunc("POST /api/v1/context", s.handleUpdateContext)
 	mux.HandleFunc("POST /api/v1/snapshot", s.handleSnapshot)
+	mux.HandleFunc("POST /api/v1/upload", s.handleUpload)
 	return mux
 }
 
@@ -130,15 +188,15 @@ func (s *WSServer) CloseTab(tabID string) {
 	_ = ts.pane.Close()
 
 	ts.mu.Lock()
-	conns := make([]*websocket.Conn, 0, len(ts.conns))
+	conns := make([]*wsClient, 0, len(ts.conns))
 	for c := range ts.conns {
 		conns = append(conns, c)
 	}
-	ts.conns = make(map[*websocket.Conn]struct{})
+	ts.conns = make(map[*wsClient]struct{})
 	ts.mu.Unlock()
 
 	for _, c := range conns {
-		_ = c.CloseNow()
+		_ = c.conn.CloseNow()
 	}
 }
 
@@ -149,7 +207,7 @@ func (s *WSServer) BroadcastMetadata(ev protocol.MetadataEvent) error {
 		return err
 	}
 	s.mu.Lock()
-	conns := make([]*websocket.Conn, 0, len(s.clients))
+	conns := make([]*wsClient, 0, len(s.clients))
 	for c := range s.clients {
 		conns = append(conns, c)
 	}
@@ -157,7 +215,7 @@ func (s *WSServer) BroadcastMetadata(ev protocol.MetadataEvent) error {
 
 	for _, c := range conns {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = c.Write(ctx, websocket.MessageBinary, frameBytes)
+		_ = c.WriteBinary(ctx, frameBytes)
 		cancel()
 	}
 	return nil
@@ -215,6 +273,97 @@ func (s *WSServer) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *WSServer) handleUpload(w http.ResponseWriter, r *http.Request) {
+	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	var uploaded []string
+
+	if strings.HasPrefix(ct, "multipart/form-data") {
+		if err := r.ParseMultipartForm(defaultWSReadLimit); err != nil || r.MultipartForm == nil {
+			http.Error(w, "invalid multipart form", http.StatusBadRequest)
+			return
+		}
+		for _, headers := range r.MultipartForm.File {
+			for _, fh := range headers {
+				f, err := fh.Open()
+				if err != nil {
+					continue
+				}
+				data, _ := io.ReadAll(f)
+				_ = f.Close()
+				destPath, saveErr := s.saveUploadedFile(fh.Filename, data)
+				if saveErr != nil {
+					http.Error(w, saveErr.Error(), http.StatusBadRequest)
+					return
+				}
+				uploaded = append(uploaded, destPath)
+			}
+		}
+		if len(uploaded) == 0 {
+			http.Error(w, "no files provided in multipart upload", http.StatusBadRequest)
+			return
+		}
+	} else {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, defaultWSReadLimit))
+		name, data, err := protocol.DecodeUploadPayload(body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		destPath, err := s.saveUploadedFile(name, data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		uploaded = append(uploaded, destPath)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"uploaded": uploaded,
+	})
+}
+
+func sanitizeUploadFilename(name string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	safeName := filepath.Base(filepath.Clean(trimmed))
+	if trimmed == "" || safeName == "." || safeName == ".." || safeName == "/" {
+		return "", fmt.Errorf("%w: invalid upload filename %q", domain.ErrInvalidConfig, name)
+	}
+	return safeName, nil
+}
+
+func (s *WSServer) saveUploadedFile(name string, data []byte) (string, error) {
+	safeName, err := sanitizeUploadFilename(name)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(s.workspaceDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating workspace directory: %w", err)
+	}
+	destPath := filepath.Join(s.workspaceDir, safeName)
+	if err := os.WriteFile(destPath, data, 0o644); err != nil {
+		return "", fmt.Errorf("writing uploaded file: %w", err)
+	}
+	return destPath, nil
+}
+
+func (s *WSServer) handleFileUploadFrame(ctx context.Context, client *wsClient, payload []byte) {
+	name, data, err := protocol.DecodeUploadPayload(payload)
+	if err != nil {
+		return
+	}
+	destPath, err := s.saveUploadedFile(name, data)
+	if err != nil {
+		return
+	}
+	safeName := filepath.Base(destPath)
+	statusLine := fmt.Sprintf("\r\n\x1b[32m✓ Uploaded %s (%d bytes) to %s\x1b[0m\r\n", safeName, len(data), destPath)
+	if diffBytes, encErr := s.codec.EncodeDiff([]byte(statusLine)); encErr == nil {
+		_ = client.WriteBinary(ctx, diffBytes)
+	}
+}
+
 func (s *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
@@ -222,19 +371,22 @@ func (s *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(defaultWSReadLimit)
 	defer func() { _ = conn.CloseNow() }()
 
+	client := &wsClient{conn: conn}
+
 	s.mu.Lock()
-	s.clients[conn] = struct{}{}
+	s.clients[client] = struct{}{}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		delete(s.clients, conn)
+		delete(s.clients, client)
 		s.mu.Unlock()
 	}()
 
 	if s.shellSpawner != nil {
-		s.handleTabShellWS(r, conn)
+		s.handleShellWS(r, client)
 		return
 	}
 
@@ -244,14 +396,14 @@ func (s *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	// 1. Immediately send a full screen snapshot (0x10) on initial connect/reconnect.
 	_ = s.comp.ConsumeDirty()
 	initialSnap, _ := s.codec.EncodeSnapshot([]byte(s.comp.View()))
-	if err := conn.Write(ctx, websocket.MessageBinary, initialSnap); err != nil {
+	if err := client.WriteBinary(ctx, initialSnap); err != nil {
 		return
 	}
 
 	// 2. Start 60fps dirty frame coalescer ticker goroutine.
-	go s.renderLoop(ctx, conn)
+	go s.renderLoop(ctx, client)
 
-	// 3. Read client binary frames (0x01 Input, 0x02 Resize, 0x03 Ping).
+	// 3. Read client binary frames (0x01 Input, 0x02 Resize, 0x03 Ping, 0x04 FileUpload).
 	for {
 		_, raw, err := conn.Read(ctx)
 		if err != nil {
@@ -275,15 +427,20 @@ func (s *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.comp.Resize(int(frame.Cols), int(frame.Rows))
 			_ = s.comp.ConsumeDirty()
 			snapBytes, _ := s.codec.EncodeSnapshot([]byte(s.comp.View()))
-			_ = conn.Write(ctx, websocket.MessageBinary, snapBytes)
+			_ = client.WriteBinary(ctx, snapBytes)
 		case protocol.FramePing:
 			pongBytes, _ := s.codec.EncodePong(frame.TimestampMS)
-			_ = conn.Write(ctx, websocket.MessageBinary, pongBytes)
+			_ = client.WriteBinary(ctx, pongBytes)
+		case protocol.FrameFileUpload:
+			if s.onActivity != nil {
+				s.onActivity()
+			}
+			s.handleFileUploadFrame(ctx, client, frame.Data)
 		}
 	}
 }
 
-func (s *WSServer) handleTabShellWS(r *http.Request, conn *websocket.Conn) {
+func (s *WSServer) handleShellWS(r *http.Request, client *wsClient) {
 	tabID := strings.TrimSpace(r.URL.Query().Get("tab"))
 	if tabID == "" {
 		tabID = "tab-1"
@@ -291,16 +448,16 @@ func (s *WSServer) handleTabShellWS(r *http.Request, conn *websocket.Conn) {
 
 	ts, err := s.getOrSpawnTab(tabID)
 	if err != nil {
-		_ = conn.Close(websocket.StatusInternalError, err.Error())
+		_ = client.conn.Close(websocket.StatusInternalError, err.Error())
 		return
 	}
 
 	ts.mu.Lock()
-	ts.conns[conn] = struct{}{}
+	ts.conns[client] = struct{}{}
 	ts.mu.Unlock()
 	defer func() {
 		ts.mu.Lock()
-		delete(ts.conns, conn)
+		delete(ts.conns, client)
 		ts.mu.Unlock()
 	}()
 
@@ -309,12 +466,15 @@ func (s *WSServer) handleTabShellWS(r *http.Request, conn *websocket.Conn) {
 
 	// Immediately replay the tab's raw scrollback buffer as a 0x10 FrameSnapshot.
 	initialSnap, _ := s.codec.EncodeSnapshot(ts.pane.Scrollback())
-	if err := conn.Write(ctx, websocket.MessageBinary, initialSnap); err != nil {
+	if err := client.WriteBinary(ctx, initialSnap); err != nil {
 		return
 	}
 
+	// Start periodic 20s FramePong keepalive so intermediate proxies/ingresses do not drop idle shells.
+	go s.keepaliveLoop(ctx, client)
+
 	for {
-		_, raw, err := conn.Read(ctx)
+		_, raw, err := client.conn.Read(ctx)
 		if err != nil {
 			if websocket.CloseStatus(err) == 4000 || strings.Contains(err.Error(), "close-tab") {
 				s.CloseTab(tabID)
@@ -339,7 +499,29 @@ func (s *WSServer) handleTabShellWS(r *http.Request, conn *websocket.Conn) {
 			_ = ts.pane.Resize(int(frame.Cols), int(frame.Rows))
 		case protocol.FramePing:
 			pongBytes, _ := s.codec.EncodePong(frame.TimestampMS)
-			_ = conn.Write(ctx, websocket.MessageBinary, pongBytes)
+			_ = client.WriteBinary(ctx, pongBytes)
+		case protocol.FrameFileUpload:
+			if s.onActivity != nil {
+				s.onActivity()
+			}
+			s.handleFileUploadFrame(ctx, client, frame.Data)
+		}
+	}
+}
+
+func (s *WSServer) keepaliveLoop(ctx context.Context, client *wsClient) {
+	ticker := time.NewTicker(s.keepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			pongBytes, _ := s.codec.EncodePong(uint64(now.UnixMilli()))
+			if err := client.WriteBinary(ctx, pongBytes); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -363,7 +545,7 @@ func (s *WSServer) getOrSpawnTab(tabID string) (*tabSession, error) {
 	ts := &tabSession{
 		id:    tabID,
 		pane:  pane,
-		conns: make(map[*websocket.Conn]struct{}),
+		conns: make(map[*wsClient]struct{}),
 	}
 	pane.SetOnOutput(func(chunk []byte) {
 		s.broadcastTabOutput(ts, chunk)
@@ -378,7 +560,7 @@ func (s *WSServer) broadcastTabOutput(ts *tabSession, chunk []byte) {
 		return
 	}
 	ts.mu.Lock()
-	conns := make([]*websocket.Conn, 0, len(ts.conns))
+	conns := make([]*wsClient, 0, len(ts.conns))
 	for c := range ts.conns {
 		conns = append(conns, c)
 	}
@@ -386,12 +568,12 @@ func (s *WSServer) broadcastTabOutput(ts *tabSession, chunk []byte) {
 
 	for _, c := range conns {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = c.Write(ctx, websocket.MessageBinary, diffBytes)
+		_ = c.WriteBinary(ctx, diffBytes)
 		cancel()
 	}
 }
 
-func (s *WSServer) renderLoop(ctx context.Context, conn *websocket.Conn) {
+func (s *WSServer) renderLoop(ctx context.Context, client *wsClient) {
 	ticker := time.NewTicker(s.tickInterval)
 	defer ticker.Stop()
 
@@ -404,7 +586,7 @@ func (s *WSServer) renderLoop(ctx context.Context, conn *websocket.Conn) {
 				continue
 			}
 			diffBytes, _ := s.codec.EncodeDiff([]byte(s.comp.View()))
-			if err := conn.Write(ctx, websocket.MessageBinary, diffBytes); err != nil {
+			if err := client.WriteBinary(ctx, diffBytes); err != nil {
 				return
 			}
 		}

@@ -1,7 +1,7 @@
 // Command orbit-helper is the interactive and flag-driven in-Pod helper CLI
 // for cloning workspace repositories, initializing and auto-loading Nix flakes
 // via direnv, configuring AI/developer tools (claude, agy, opencode, gh, git),
-// and persisting state across ephemeral Machine Pod restarts.
+// managing Git identity and SSH keys, and persisting state across ephemeral Machine Pod restarts.
 package main
 
 import (
@@ -69,7 +69,7 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 
 	rootCmd := &cobra.Command{
 		Use:           "orbit-helper",
-		Short:         "Orbit Machine helper for workspace repos, Nix flakes, and AI tools",
+		Short:         "Orbit Machine helper for workspace repos, Nix flakes, Git/SSH keys, and AI tools",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -95,6 +95,19 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		Short: "Launch the interactive Orbit Helper menu",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return mgr.RunInteractive(cmd.Context(), stdin, cmd.OutOrStdout())
+		},
+	}
+
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "Ensure shell, Git identity, SSH key, and workspace Nix flakes are initialized",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := mgr.EnsureGitAndSSH(); err != nil {
+				return err
+			}
+			_, _ = mgr.AutoloadAllWorkspaceFlakes(cmd.Context())
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "✓ Initialized Orbit shell, Git identity, SSH key, and workspace flakes")
+			return nil
 		},
 	}
 
@@ -140,7 +153,7 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		flakePackages []string
 	)
 	flakeCmd := &cobra.Command{
-		Use:   "flake [init|autoload]",
+		Use:   "flake [init|autoload] [stack]",
 		Short: "Initialize a Nix flake.nix or enable automatic flake loading via direnv",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			action := "init"
@@ -166,7 +179,13 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 			if targetDir == "" {
 				targetDir, _ = os.Getwd()
 			}
-			if err := mgr.InitFlake(cmd.Context(), targetDir, flakePackages); err != nil {
+			pkgs := append([]string(nil), flakePackages...)
+			if len(args) > 1 {
+				pkgs = append(pkgs, args[1:]...)
+			} else if action != "init" && action != "" {
+				pkgs = append(pkgs, action)
+			}
+			if err := mgr.InitFlake(cmd.Context(), targetDir, pkgs); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Initialized flake.nix and direnv auto-loading in %s\n", targetDir)
@@ -178,13 +197,15 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 
 	var selectedTools []string
 	toolsCmd := &cobra.Command{
-		Use:   "tools",
-		Short: "Configure multiple AI and developer tools (claude, agy, opencode, gh, git, or all)",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if len(selectedTools) == 0 {
-				selectedTools = []string{"all"}
+		Use:   "tools [tool...]",
+		Short: "Configure multiple AI and developer tools (claude, codex, gemini, opencode, cursor, aider, agy, gh, git, or all)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			tools := append([]string(nil), selectedTools...)
+			tools = append(tools, args...)
+			if len(tools) == 0 {
+				tools = []string{"all"}
 			}
-			configured, err := mgr.ConfigureTools(selectedTools)
+			configured, err := mgr.ConfigureTools(tools)
 			if err != nil {
 				return err
 			}
@@ -194,9 +215,99 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 	}
 	toolsCmd.Flags().StringSliceVar(&selectedTools, "select", nil, "Comma-separated tools to configure (claude,agy,opencode,gh,git,all)")
 
+	var (
+		gitName   string
+		gitEmail  string
+		gitBranch string
+	)
+	gitCmd := &cobra.Command{
+		Use:   "git",
+		Short: "Configure Git author identity (user.name, user.email) and default branch",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(gitName) == "" && strings.TrimSpace(gitEmail) == "" {
+				return mgr.RunInteractiveGit(stdin, cmd.OutOrStdout())
+			}
+			if err := mgr.ConfigureGit(gitName, gitEmail, gitBranch); err != nil {
+				return err
+			}
+			branch := strings.TrimSpace(gitBranch)
+			if branch == "" {
+				branch = "main"
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Configured Git identity: %s <%s> (defaultBranch: %s)\n", strings.TrimSpace(gitName), strings.TrimSpace(gitEmail), branch)
+			return nil
+		},
+	}
+	gitCmd.Flags().StringVar(&gitName, "name", "", "Git author name (user.name)")
+	gitCmd.Flags().StringVar(&gitEmail, "email", "", "Git author email (user.email)")
+	gitCmd.Flags().StringVar(&gitBranch, "branch", "main", "Git default branch (init.defaultBranch)")
+
+	var (
+		sshGenerate bool
+		sshShow     bool
+		sshSet      string
+		sshImport   string
+		sshComment  string
+	)
+	sshKeyCmd := &cobra.Command{
+		Use:   "ssh-key",
+		Short: "Generate, import, or display your Git Ed25519 SSH key",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if sshGenerate {
+				cfg, err := mgr.GenerateSSHKey(sshComment)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Generated Ed25519 SSH keypair (~/.ssh/id_ed25519)\nPublic key (add to GitHub/GitLab):\n%s\n", cfg.PublicKey)
+				return nil
+			}
+			if strings.TrimSpace(sshSet) != "" {
+				cfg, err := mgr.SetSSHKey(sshSet)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Imported SSH key (~/.ssh/id_ed25519)\nPublic key:\n%s\n", cfg.PublicKey)
+				return nil
+			}
+			if strings.TrimSpace(sshImport) != "" {
+				var raw []byte
+				var err error
+				if strings.TrimSpace(sshImport) == "-" {
+					raw, err = io.ReadAll(stdin)
+				} else {
+					raw, err = os.ReadFile(strings.TrimSpace(sshImport))
+				}
+				if err != nil {
+					return err
+				}
+				cfg, err := mgr.SetSSHKey(string(raw))
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Imported SSH key (~/.ssh/id_ed25519)\nPublic key:\n%s\n", cfg.PublicKey)
+				return nil
+			}
+			if sshShow {
+				pub, err := mgr.PublicSSHKey()
+				if err != nil {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No SSH public key found. Run 'orbit ssh-key --generate' to create one.")
+					return nil
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", pub)
+				return nil
+			}
+			return mgr.RunInteractiveSSHKey(stdin, cmd.OutOrStdout())
+		},
+	}
+	sshKeyCmd.Flags().BoolVar(&sshGenerate, "generate", false, "Generate a new Ed25519 SSH keypair")
+	sshKeyCmd.Flags().BoolVar(&sshShow, "show", false, "Print the current SSH public key")
+	sshKeyCmd.Flags().StringVar(&sshSet, "set", "", "Import an SSH private key PEM string directly")
+	sshKeyCmd.Flags().StringVar(&sshImport, "import", "", "Import an SSH private key from a file path (or '-' for stdin)")
+	sshKeyCmd.Flags().StringVar(&sshComment, "comment", "", "Optional comment for generated SSH key")
+
 	statusCmd := &cobra.Command{
 		Use:   "status",
-		Short: "Display Orbit workspace context, cloned repositories, and configured tools",
+		Short: "Display Orbit workspace context, cloned repositories, Git/SSH key, and configured tools",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			rep, _ := mgr.Status()
 			_, _ = fmt.Fprint(cmd.OutOrStdout(), rep.Format())
@@ -222,6 +333,6 @@ func NewRootCmd(stdin io.Reader, stdout, stderr io.Writer, factory ManagerFactor
 		},
 	}
 
-	rootCmd.AddCommand(menuCmd, reposCmd, flakeCmd, toolsCmd, statusCmd, saveCmd, versionCmd)
+	rootCmd.AddCommand(menuCmd, initCmd, reposCmd, flakeCmd, toolsCmd, gitCmd, sshKeyCmd, statusCmd, saveCmd, versionCmd)
 	return rootCmd
 }

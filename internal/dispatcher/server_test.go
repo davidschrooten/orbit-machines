@@ -73,10 +73,11 @@ func TestServer_WebSocketTerminalBootAndSplice(t *testing.T) {
 	podSrv := newTestPodWSServer(t, frameCodec)
 	defer podSrv.Close()
 
-	podWSURL := "ws" + strings.TrimPrefix(podSrv.URL, "http") + "/ws"
+	podWSURL := "ws" + strings.TrimPrefix(podSrv.URL, "http") + "/ws?existing=1"
 	fakeK8s := k8s.NewFakePodOrchestrator(10)
 	fakeK8s.SetDefaultWebSocketURL(podWSURL)
 	fakeOrbit := orbitclient.NewFakeClient()
+	fakeOrbit.FailSubject = "usr_01habc" // triggers fallback to claims.UserLogin ("alice")
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ticketCodec, err := ticket.NewCodecFromClusterToken(testClusterToken)
@@ -194,6 +195,22 @@ func TestServer_WebSocketTerminalBootAndSplice(t *testing.T) {
 		t.Fatalf("unexpected spliced diff frame: %+v", diffDecoded)
 	}
 
+	// Reconnect a second client for the same MachineID (exercises registerActiveSession replacing previous session)
+	// and close with 4000 ("close-tab") to exercise pumpWebSocket close-tab forwarding.
+	clientConn2, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose
+	if err == nil {
+		for {
+			_, raw2, rErr := clientConn2.Read(ctx)
+			if rErr != nil {
+				break
+			}
+			if dec2, dErr := frameCodec.Decode(raw2); dErr == nil && dec2.Type == protocol.FrameSnapshot {
+				break
+			}
+		}
+		_ = clientConn2.Close(4000, "close-tab")
+	}
+
 	// 4. DELETE /api/v1/sessions/{ws_id}/{sub} terminates the Pod and closes active WebSocket.
 	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, gwSrv.URL+"/api/v1/sessions/ws_01HXYZ/usr_01HABC", nil)
 	delReq.Header.Set("Authorization", "Bearer "+testClusterToken)
@@ -217,6 +234,7 @@ func TestServer_HeartbeatLoopAndRevocation(t *testing.T) {
 
 	fakeK8s := k8s.NewFakePodOrchestrator(10)
 	fakeOrbit := orbitclient.NewFakeClient()
+	fakeOrbit.FailSubject = "usr_01habc" // triggers fallback to claims.UserLogin ("alice")
 	ticketCodec, _ := ticket.NewCodecFromClusterToken(testClusterToken)
 	frameCodec, _ := protocol.NewFrameCodec()
 
@@ -264,6 +282,7 @@ func TestServer_ValidationAndAuthErrors(t *testing.T) {
 
 	fakeK8s := k8s.NewFakePodOrchestrator(1)
 	fakeOrbit := orbitclient.NewFakeClient()
+	fakeOrbit.FailSubject = "usr_01habc" // triggers fallback to claims.UserLogin ("alice")
 	ticketCodec, _ := ticket.NewCodecFromClusterToken(testClusterToken)
 	frameCodec, _ := protocol.NewFrameCodec()
 

@@ -3,7 +3,11 @@ package helper_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +27,11 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 
 	if _, err := helper.NewManager(helper.Config{}); !errors.Is(err, domain.ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for empty Config, got %v", err)
+	}
+	blockingHome := filepath.Join(t.TempDir(), "not-a-dir")
+	_ = os.WriteFile(blockingHome, []byte("x"), 0o644)
+	if _, err := helper.NewManager(helper.Config{HomeDir: blockingHome, WorkDir: filepath.Join(blockingHome, "ws")}); err == nil {
+		t.Fatalf("expected error when HomeDir is a regular file")
 	}
 
 	homeDir := filepath.Join(t.TempDir(), "home")
@@ -154,7 +163,8 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 		t.Fatalf("CloneRepositories custom URL = %v, err=%v", extraCloned, err)
 	}
 
-	// 3. InitFlake with custom packages and AutoloadAllWorkspaceFlakes
+	// 3. InitFlake with custom packages and AutoloadAllWorkspaceFlakes (with a regular file in workDir)
+	_ = os.WriteFile(filepath.Join(workDir, "README.txt"), []byte("workspace notes\n"), 0o644)
 	customRepo := filepath.Join(workDir, "custom-flake-repo")
 	if err := mgr.InitFlake(ctx, customRepo, []string{"go", "golangci-lint", "jq"}); err != nil {
 		t.Fatalf("InitFlake: %v", err)
@@ -216,6 +226,170 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 	}
 }
 
+func TestManager_GitAndSSHKeyPersistenceAndRestoration(t *testing.T) {
+	t.Parallel()
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	workDir := filepath.Join(homeDir, "workspace")
+
+	mgr, err := helper.NewManager(helper.Config{
+		HomeDir: homeDir,
+		WorkDir: workDir,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// 1. Auto-initialized .gitconfig exists from NewManager -> EnsureGitAndSSH
+	initialGitCfg, err := os.ReadFile(filepath.Join(homeDir, ".gitconfig"))
+	if err != nil {
+		t.Fatalf("ReadFile(.gitconfig): %v", err)
+	}
+	for _, needle := range []string{"defaultBranch = main", "rebase = false", "directory = *"} {
+		if !strings.Contains(string(initialGitCfg), needle) {
+			t.Fatalf(".gitconfig missing %q:\n%s", needle, string(initialGitCfg))
+		}
+	}
+
+	// 2. ConfigureGit validation and persistence
+	if err := mgr.ConfigureGit("", "alice@acme.dev", "main"); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty git name, got %v", err)
+	}
+	if err := mgr.ConfigureGit("Alice Developer", "alice@acme.dev", ""); err != nil {
+		t.Fatalf("ConfigureGit: %v", err)
+	}
+	gitBytes, _ := os.ReadFile(filepath.Join(homeDir, ".gitconfig"))
+	if !strings.Contains(string(gitBytes), "name = Alice Developer") || !strings.Contains(string(gitBytes), "email = alice@acme.dev") {
+		t.Fatalf("unexpected .gitconfig after ConfigureGit:\n%s", string(gitBytes))
+	}
+
+	// 3. Before generating SSH key, PublicSSHKey returns ErrInvalidConfig, and interactive show prints help message
+	if _, err := mgr.PublicSSHKey(); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig when no SSH key configured, got %v", err)
+	}
+	var emptySSHOut bytes.Buffer
+	if err := mgr.RunInteractiveSSHKey(strings.NewReader("3\n"), &emptySSHOut); err != nil || !strings.Contains(emptySSHOut.String(), "No SSH public key found") {
+		t.Fatalf("expected interactive show before key generation to succeed with message, got (%q, %v)", emptySSHOut.String(), err)
+	}
+
+	// 4. GenerateSSHKey creates ~/.ssh/id_ed25519 (0600), id_ed25519.pub (0644), config (0600), and persists to state
+	sshCfg, err := mgr.GenerateSSHKey("alice@acme.dev")
+	if err != nil {
+		t.Fatalf("GenerateSSHKey: %v", err)
+	}
+	if !strings.HasPrefix(sshCfg.PublicKey, "ssh-ed25519 ") || !strings.HasSuffix(sshCfg.PublicKey, "alice@acme.dev") {
+		t.Fatalf("unexpected generated public key: %q", sshCfg.PublicKey)
+	}
+
+	privPath := filepath.Join(homeDir, ".ssh", "id_ed25519")
+	privInfo, err := os.Stat(privPath)
+	if err != nil {
+		t.Fatalf("Stat(id_ed25519): %v", err)
+	}
+	if privInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("id_ed25519 mode = %o, want 0600", privInfo.Mode().Perm())
+	}
+
+	// If ssh-keygen is installed on the host, verify OpenSSH parses our pure-Go private key and outputs the exact same public key
+	if sshKeygenPath, lookErr := exec.LookPath("ssh-keygen"); lookErr == nil {
+		derivedOut, cmdErr := exec.Command(sshKeygenPath, "-y", "-f", privPath).CombinedOutput()
+		if cmdErr != nil {
+			t.Fatalf("ssh-keygen -y -f failed: %v (%s)", cmdErr, string(derivedOut))
+		}
+		wantPrefix := strings.Fields(sshCfg.PublicKey)[0] + " " + strings.Fields(sshCfg.PublicKey)[1]
+		if !strings.HasPrefix(strings.TrimSpace(string(derivedOut)), wantPrefix) {
+			t.Fatalf("ssh-keygen derived %q, want prefix %q", strings.TrimSpace(string(derivedOut)), wantPrefix)
+		}
+	}
+
+	// 5. Simulate ephemeral Pod restart: delete ~/.gitconfig and ~/.ssh, then call EnsureGitAndSSH() -> both restored from state!
+	_ = os.Remove(filepath.Join(homeDir, ".gitconfig"))
+	_ = os.RemoveAll(filepath.Join(homeDir, ".ssh"))
+	if err := mgr.EnsureGitAndSSH(); err != nil {
+		t.Fatalf("EnsureGitAndSSH restore: %v", err)
+	}
+	restoredPub, err := mgr.PublicSSHKey()
+	if err != nil || restoredPub != sshCfg.PublicKey {
+		t.Fatalf("PublicSSHKey after restore = (%q, %v), want %q", restoredPub, err, sshCfg.PublicKey)
+	}
+	restoredGit, _ := os.ReadFile(filepath.Join(homeDir, ".gitconfig"))
+	if !strings.Contains(string(restoredGit), "Alice Developer") {
+		t.Fatalf("expected .gitconfig to be restored with Alice Developer, got:\n%s", string(restoredGit))
+	}
+
+	// 6. SetSSHKey with OpenSSH PEM and PKCS#8 Ed25519 PEM, plus invalid key errors
+	if _, err := mgr.SetSSHKey(""); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for empty private key")
+	}
+	if _, err := mgr.SetSSHKey("not-a-pem-key"); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for invalid PEM")
+	}
+	if _, err := mgr.SetSSHKey(sshCfg.PrivateKey); err != nil {
+		t.Fatalf("SetSSHKey(OpenSSH PEM): %v", err)
+	}
+
+	_, pkcs8Priv, _ := ed25519.GenerateKey(rand.Reader)
+	pkcs8DER, _ := x509.MarshalPKCS8PrivateKey(pkcs8Priv)
+	pkcs8PEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8DER}))
+	if _, err := mgr.SetSSHKey(pkcs8PEM); err != nil {
+		t.Fatalf("SetSSHKey(PKCS#8 PEM): %v", err)
+	}
+
+	// 7. Additional AI tools in ConfigureTools (gemini, codex, cursor, aider) + stack name in InitFlake
+	if _, err := mgr.ConfigureTools([]string{"gemini", "codex", "cursor", "aider"}); err != nil {
+		t.Fatalf("ConfigureTools additional AI tools: %v", err)
+	}
+	stackRepo := filepath.Join(workDir, "stack-repo")
+	if err := mgr.InitFlake(context.Background(), stackRepo, []string{"go"}); err != nil {
+		t.Fatalf("InitFlake(go): %v", err)
+	}
+	stackFlake, _ := os.ReadFile(filepath.Join(stackRepo, "flake.nix"))
+	for _, pkg := range []string{"pkgs.go", "pkgs.golangci-lint", "pkgs.htop", "pkgs.curl", "pkgs.wget", "pkgs.git"} {
+		if !strings.Contains(string(stackFlake), pkg) {
+			t.Fatalf("InitFlake(go) missing %q:\n%s", pkg, string(stackFlake))
+		}
+	}
+
+	// 8. RunInteractiveGit and RunInteractiveSSHKey (options 1, 2 paste, 3 show, and invalid option)
+	var gitOut bytes.Buffer
+	if err := mgr.RunInteractiveGit(strings.NewReader("Bob\nbob@acme.dev\ndevelop\n"), &gitOut); err != nil {
+		t.Fatalf("RunInteractiveGit: %v", err)
+	}
+	var sshOut bytes.Buffer
+	if err := mgr.RunInteractiveSSHKey(strings.NewReader("1\n"), &sshOut); err != nil {
+		t.Fatalf("RunInteractiveSSHKey(1): %v", err)
+	}
+	if err := mgr.RunInteractiveSSHKey(strings.NewReader("2\n"+sshCfg.PrivateKey+"\n"), &sshOut); err != nil {
+		t.Fatalf("RunInteractiveSSHKey(2): %v", err)
+	}
+	if err := mgr.RunInteractiveSSHKey(strings.NewReader("3\n"), &sshOut); err != nil {
+		t.Fatalf("RunInteractiveSSHKey(3): %v", err)
+	}
+	if err := mgr.RunInteractiveSSHKey(strings.NewReader("99\n"), &sshOut); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for invalid interactive ssh-key choice, got %v", err)
+	}
+
+	// 9. PublicSSHKey fallback from state when id_ed25519.pub is removed, and LoadState fallback from helper-state.json
+	_ = os.Remove(filepath.Join(homeDir, ".ssh", "id_ed25519.pub"))
+	if pub, err := mgr.PublicSSHKey(); err != nil || !strings.HasPrefix(pub, "ssh-ed25519 ") {
+		t.Fatalf("PublicSSHKey state fallback = (%q, %v)", pub, err)
+	}
+	_ = os.Remove(filepath.Join(homeDir, ".config", "orbit", "state.json"))
+	if st, err := mgr.LoadState(); err != nil || st.Git == nil {
+		t.Fatalf("LoadState helper-state.json fallback = (%+v, %v)", st, err)
+	}
+
+	// 10. Corrupt OpenSSH PEM blocks in SetSSHKey
+	corruptHeaderPEM := string(pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("openssh-key-v1\x00short")}))
+	if _, err := mgr.SetSSHKey(corruptHeaderPEM); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for corrupt OpenSSH header")
+	}
+	unknownPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("bad")}))
+	if _, err := mgr.SetSSHKey(unknownPEM); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for unsupported PEM key")
+	}
+}
+
 func TestManager_InteractiveMenuAndEnvFallbacks(t *testing.T) {
 	homeDir := filepath.Join(t.TempDir(), "home")
 	workDir := filepath.Join(homeDir, "workspace")
@@ -245,16 +419,24 @@ func TestManager_InteractiveMenuAndEnvFallbacks(t *testing.T) {
 
 	// Interactive menu session exercising options 1 (repos), 2 (flake), 3 (tools), 4 (status & save), and q (quit)
 	input := strings.Join([]string{
-		"1",            // 1) Clone & setup workspace repositories
-		"all",          // clone all
-		"y",            // init missing flake.nix
-		"2",            // 2) Initialize / autoload Nix flake
-		"orbit-web",    // repo name
-		"go,ripgrep",   // packages
-		"3",            // 3) Configure AI & developer tools
-		"1,2,3,4,5",    // multi-select by numbers (claude, agy, opencode, gh, git)
-		"4",            // 4) Status & save
-		"q",            // Quit
+		"1",           // 1) Clone & setup workspace repositories
+		"all",         // clone all
+		"y",           // init missing flake.nix
+		"2",           // 2) Initialize / autoload Nix flake
+		"orbit-web",   // repo name
+		"go,ripgrep",  // packages
+		"3",           // 3) Configure AI & developer tools
+		"1,2,3,4,5",   // multi-select by numbers (claude, agy, opencode, gh, git)
+		"4",           // 4) Status & save
+		"5",           // 5) Configure Git identity
+		"Env User",    // user.name
+		"dev@env.dev", // user.email
+		"main",        // default branch
+		"6",           // 6) Configure Git SSH key
+		"1",           // 1) Generate new Ed25519 SSH keypair
+		"6",           // 6) Configure Git SSH key
+		"3",           // 3) Show current SSH public key
+		"q",           // Quit
 	}, "\n") + "\n"
 
 	var out bytes.Buffer
@@ -285,6 +467,8 @@ func TestManager_InteractiveMenuAndEnvFallbacks(t *testing.T) {
 		"",        // blank packages -> auto-detect
 		"3",       // tools
 		"badtool", // triggers error print in interactive loop
+		"6",       // ssh-key
+		"99",      // triggers error print in interactive loop
 	}, "\n") + "\n"
 	var out2 bytes.Buffer
 	if err := mgr.RunInteractive(context.Background(), strings.NewReader(input2), &out2); err != nil {
@@ -383,7 +567,7 @@ func TestManager_EdgeCasesAndDefaultCloner(t *testing.T) {
 
 	_ = emptyMgr.SaveContext(helper.OrbitContext{
 		Repositories: []protocol.RepoCredential{
-			{Name: "cloned-from-local", CloneURL: srcRepo, DefaultBranch: "main"},
+			{Name: "cloned-from-local", CloneURL: srcRepo, DefaultBranch: "main", GitToken: "tok_for_local_path"},
 		},
 	})
 	if _, err := emptyMgr.CloneRepositories(ctx, helper.CloneOptions{CloneAll: true}); err != nil {
@@ -392,7 +576,22 @@ func TestManager_EdgeCasesAndDefaultCloner(t *testing.T) {
 	if _, err := emptyMgr.CloneRepositories(ctx, helper.CloneOptions{NamesOrURLs: []string{"/nonexistent/git/repo/path"}}); err == nil {
 		t.Fatalf("expected error when defaultGitCloner fails")
 	}
-	if _, err := emptyMgr.CloneRepositories(ctx, helper.CloneOptions{NamesOrURLs: []string{"bare-repo-name"}}); err == nil {
+	if _, err := emptyMgr.CloneRepositories(ctx, helper.CloneOptions{NamesOrURLs: []string{"", "bare-repo-name"}}); err == nil {
 		t.Fatalf("expected error for bare-repo-name")
 	}
+
+	// DirenvAllower error propagation in EnableFlakeAutoload and AutoloadAllWorkspaceFlakes
+	errMgr, _ := helper.NewManager(helper.Config{
+		HomeDir: emptyHome,
+		WorkDir: filepath.Join(emptyHome, "workspace"),
+		DirenvAllower: func(_ context.Context, _ string) error {
+			return errors.New("direnv failed")
+		},
+	})
+	_ = os.WriteFile(filepath.Join(emptyHome, "workspace", "cloned-from-local", "flake.nix"), []byte("{}"), 0o644)
+	if _, err := errMgr.AutoloadAllWorkspaceFlakes(ctx); err == nil {
+		t.Fatalf("expected error when DirenvAllower fails in AutoloadAllWorkspaceFlakes")
+	}
+	var errMenuOut bytes.Buffer
+	_ = errMgr.RunInteractive(ctx, strings.NewReader("1\nnonexistent\nn\n2\n\n2\ncloned-from-local\ngo\nq\n"), &errMenuOut)
 }

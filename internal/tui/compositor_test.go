@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -221,6 +224,7 @@ func TestWSServer_60fpsDiffCoalescingSnapshotPingAndMetadata(t *testing.T) {
 	_, _ = tui.NewWSServer(tui.WSServerConfig{Compositor: comp}) // default TickInterval
 	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
 		Compositor:   comp,
+		WorkspaceDir: t.TempDir(),
 		TickInterval: 16 * time.Millisecond,
 		OnActivity: func() {
 			activityCount++
@@ -358,17 +362,27 @@ func TestWSServer_60fpsDiffCoalescingSnapshotPingAndMetadata(t *testing.T) {
 	if !gotMeta {
 		t.Fatalf("expected FrameMetadata event from BroadcastMetadata")
 	}
+
+	// 7. Send FrameFileUpload (0x04) on compositor WS connection.
+	upBytes, _ := protocol.EncodeUploadFrame("comp-file.txt", []byte("comp-data"))
+	_ = conn.Write(ctx, websocket.MessageBinary, upBytes)
+	for range 5 {
+		f := readDecoded()
+		if f.Type == protocol.FrameDiff && strings.Contains(string(f.Data), "comp-file.txt") {
+			break
+		}
+	}
 }
 
 func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 	t.Parallel()
 
 	var (
-		mu          sync.Mutex
+		mu           sync.Mutex
 		spawnedPanes = make(map[string]*pty.Pane)
-		lastCtxReq  tui.ContextUpdateRequest
-		snapCount   int
-		failSpawn   bool
+		lastCtxReq   tui.ContextUpdateRequest
+		snapCount    int
+		failSpawn    bool
 	)
 
 	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
@@ -565,5 +579,173 @@ func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 	if err == nil {
 		_, _, _ = connFail.Read(ctx)
 		_ = connFail.CloseNow()
+	}
+}
+
+func TestWSServer_FileUploadAndKeepalive(t *testing.T) {
+	t.Parallel()
+
+	uploadDir := filepath.Join(t.TempDir(), "workspace")
+	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+		ShellSpawner: func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
+			p := pty.NewVirtualPane(tabID, "Shell "+tabID, cols, rows)
+			p.FeedOutput([]byte("$ "))
+			return p, nil
+		},
+		KeepaliveInterval: 20 * time.Millisecond,
+		OnActivity:        func() {},
+	}, tui.WithWorkspaceDir(uploadDir))
+	if err != nil {
+		t.Fatalf("NewWSServer: %v", err)
+	}
+	defer func() { _ = wsSrv.Close() }()
+
+	httpSrv := httptest.NewServer(wsSrv.Handler())
+	defer httpSrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	codec, _ := protocol.NewFrameCodec()
+	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/ws?tab=upload-tab"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("websocket.Dial: %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	// Drain initial snapshot
+	_, _, _ = conn.Read(ctx)
+
+	// 1. Send 0x04 FrameFileUpload with path traversal prefix -> sanitized to base filename and saved in uploadDir
+	fileBytes := []byte("hello uploaded world\n")
+	upFrame, err := protocol.EncodeUploadFrame("../../secret/notes.txt", fileBytes)
+	if err != nil {
+		t.Fatalf("EncodeUploadFrame: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, upFrame); err != nil {
+		t.Fatalf("conn.Write upload frame: %v", err)
+	}
+
+	var gotUploadDiff, gotKeepalivePong bool
+	for range 10 {
+		_, raw, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("conn.Read: %v", err)
+		}
+		f, err := codec.Decode(raw)
+		if err != nil {
+			t.Fatalf("codec.Decode: %v", err)
+		}
+		if f.Type == protocol.FrameDiff && strings.Contains(string(f.Data), "✓ Uploaded notes.txt") {
+			gotUploadDiff = true
+		}
+		if f.Type == protocol.FramePong {
+			gotKeepalivePong = true
+		}
+		if gotUploadDiff && gotKeepalivePong {
+			break
+		}
+	}
+	if !gotUploadDiff {
+		t.Fatalf("did not receive upload confirmation FrameDiff")
+	}
+	if !gotKeepalivePong {
+		t.Fatalf("did not receive periodic keepalive FramePong")
+	}
+
+	savedBytes, err := os.ReadFile(filepath.Join(uploadDir, "notes.txt"))
+	if err != nil || !bytes.Equal(savedBytes, fileBytes) {
+		t.Fatalf("ReadFile(notes.txt) = (%q, %v), want %q", savedBytes, err, fileBytes)
+	}
+
+	// 2. POST /api/v1/upload with JSON UploadPayload
+	jsonUpload, _ := json.Marshal(protocol.UploadPayload{
+		Name: "dir/config.yaml",
+		Data: "a2V5OiB2YWx1ZQo=", // "key: value\n"
+	})
+	resp, err := http.Post(httpSrv.URL+"/api/v1/upload", "application/json", bytes.NewReader(jsonUpload))
+	if err != nil {
+		t.Fatalf("POST /api/v1/upload JSON: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/upload JSON status = %d, want 200", resp.StatusCode)
+	}
+	cfgBytes, err := os.ReadFile(filepath.Join(uploadDir, "config.yaml"))
+	if err != nil || string(cfgBytes) != "key: value\n" {
+		t.Fatalf("ReadFile(config.yaml) = (%q, %v)", cfgBytes, err)
+	}
+
+	// 3. POST /api/v1/upload with multipart/form-data
+	var mpBuf bytes.Buffer
+	mw := multipart.NewWriter(&mpBuf)
+	fw, err := mw.CreateFormFile("files", "archive.tar")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	_, _ = fw.Write([]byte("tar-bytes"))
+	_ = mw.Close()
+
+	mpResp, err := http.Post(httpSrv.URL+"/api/v1/upload", mw.FormDataContentType(), &mpBuf)
+	if err != nil {
+		t.Fatalf("POST /api/v1/upload multipart: %v", err)
+	}
+	_ = mpResp.Body.Close()
+	if mpResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/upload multipart status = %d, want 200", mpResp.StatusCode)
+	}
+	tarBytes, err := os.ReadFile(filepath.Join(uploadDir, "archive.tar"))
+	if err != nil || string(tarBytes) != "tar-bytes" {
+		t.Fatalf("ReadFile(archive.tar) = (%q, %v)", tarBytes, err)
+	}
+
+	// 4. Invalid upload requests return 400 Bad Request
+	badResp, _ := http.Post(httpSrv.URL+"/api/v1/upload", "application/json", strings.NewReader("{bad"))
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid JSON upload, got %d", badResp.StatusCode)
+	}
+	notMultipartResp, _ := http.Post(httpSrv.URL+"/api/v1/upload", "multipart/form-data; boundary=missing", strings.NewReader("not-multipart"))
+	_ = notMultipartResp.Body.Close()
+	if notMultipartResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed multipart upload, got %d", notMultipartResp.StatusCode)
+	}
+	var emptyMP bytes.Buffer
+	emptyMW := multipart.NewWriter(&emptyMP)
+	_ = emptyMW.Close()
+	emptyMPResp, _ := http.Post(httpSrv.URL+"/api/v1/upload", emptyMW.FormDataContentType(), &emptyMP)
+	_ = emptyMPResp.Body.Close()
+	if emptyMPResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty multipart upload, got %d", emptyMPResp.StatusCode)
+	}
+	// Corrupt 0x04 frame over WS is ignored without dropping the connection
+	_ = conn.Write(ctx, websocket.MessageBinary, []byte{byte(protocol.FrameFileUpload), '{', 'b', 'a', 'd'})
+
+	// Test NewWSServer workspaceDir env fallbacks and saveUploadedFile error when workspaceDir is a regular file
+	blockingFile := filepath.Join(t.TempDir(), "file-not-dir")
+	_ = os.WriteFile(blockingFile, []byte("x"), 0o644)
+	errSrv, _ := tui.NewWSServer(tui.WSServerConfig{
+		ShellSpawner: func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
+			return pty.NewVirtualPane(tabID, tabID, cols, rows), nil
+		},
+		WorkspaceDir: blockingFile,
+	})
+	errHTTPSrv := httptest.NewServer(errSrv.Handler())
+	defer errHTTPSrv.Close()
+	failSaveResp, _ := http.Post(errHTTPSrv.URL+"/api/v1/upload", "application/json", bytes.NewReader(jsonUpload))
+	_ = failSaveResp.Body.Close()
+	if failSaveResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 when workspaceDir is a regular file, got %d", failSaveResp.StatusCode)
+	}
+	var mpFailBuf bytes.Buffer
+	mwFail := multipart.NewWriter(&mpFailBuf)
+	fwFail, _ := mwFail.CreateFormFile("files", "fail.txt")
+	_, _ = fwFail.Write([]byte("x"))
+	_ = mwFail.Close()
+	mpFailResp, _ := http.Post(errHTTPSrv.URL+"/api/v1/upload", mwFail.FormDataContentType(), &mpFailBuf)
+	_ = mpFailResp.Body.Close()
+	if mpFailResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on multipart when workspaceDir is a regular file, got %d", mpFailResp.StatusCode)
 	}
 }

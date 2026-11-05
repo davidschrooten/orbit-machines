@@ -1,6 +1,6 @@
 // Package shellinit bootstraps the Orbit Machine interactive shell environment
-// with the Tokyo Night Starship prompt preset (Orbit 🪐 logo), direnv workspace
-// whitelisting, and bash startup hooks.
+// with the Starship Jetpack prompt preset, direnv workspace whitelisting, and
+// bash startup hooks with an interactive welcome banner.
 package shellinit
 
 import (
@@ -13,98 +13,368 @@ import (
 )
 
 const (
-	bashrcMarkerStart = "# >>> orbit-machines shell init >>>"
-	bashrcMarkerEnd   = "# <<< orbit-machines shell init <<<"
+	bashrcMarkerStart    = "# >>> orbit-machines shell init >>>"
+	bashrcMarkerEnd      = "# <<< orbit-machines shell init <<<"
+	altBashrcMarkerStart = "# >>> orbit-machines shellinit >>>"
+	altBashrcMarkerEnd   = "# <<< orbit-machines shellinit <<<"
+	jetpackPresetHeader  = "# orbit-preset: jetpack"
 )
 
-// TokyoNightStarshipTOML is the Tokyo Night preset for Starship with the Orbit logo (🪐).
-const TokyoNightStarshipTOML = `format = """
-[░▒▓](#a3aed2)\
-[ 🪐 ](bg:#a3aed2 fg:#090c0c)\
-[](bg:#769ff0 fg:#a3aed2)\
+// JetpackStarshipTOML is the official Starship Jetpack preset configured for Orbit Machines.
+const JetpackStarshipTOML = `# orbit-preset: jetpack
+# version: 1.0.0
+"$schema" = 'https://starship.rs/config-schema.json'
+
+add_newline = true
+continuation_prompt = "[▸▹ ](dimmed white)"
+
+format = """($nix_shell$container$fill$git_metrics\n)$cmd_duration\
+$hostname\
+$localip\
+$shlvl\
+$shell\
+$env_var\
+$jobs\
+$sudo\
+$username\
+$character"""
+
+right_format = """
+$singularity\
+$kubernetes\
 $directory\
-[](fg:#769ff0 bg:#394260)\
+$vcsh\
+$fossil_branch\
 $git_branch\
+$git_commit\
+$git_state\
 $git_status\
-[](fg:#394260 bg:#212736)\
-$nodejs\
-$rust\
+$hg_branch\
+$pijul_channel\
+$docker_context\
+$package\
+$c\
+$cpp\
+$cmake\
+$cobol\
+$daml\
+$dart\
+$deno\
+$dotnet\
+$elixir\
+$elm\
+$erlang\
+$fennel\
+$fortran\
 $golang\
+$guix_shell\
+$haskell\
+$haxe\
+$helm\
+$java\
+$julia\
+$kotlin\
+$gradle\
+$lua\
+$maven\
+$nim\
+$nodejs\
+$bun\
+$ocaml\
+$opa\
+$perl\
 $php\
-$ruby\
+$pulumi\
+$purescript\
 $python\
-$nix_shell\
-[](fg:#212736 bg:#1d2230)\
-$time\
-[ ](fg:#1d2230)\
-\n$character"""
+$raku\
+$rlang\
+$red\
+$ruby\
+$rust\
+$scala\
+$solidity\
+$swift\
+$terraform\
+$vlang\
+$vagrant\
+$xmake\
+$zig\
+$buf\
+$conda\
+$pixi\
+$meson\
+$spack\
+$memory_usage\
+$aws\
+$gcloud\
+$openstack\
+$azure\
+$crystal\
+$custom\
+$status\
+$os\
+$battery\
+$time"""
+
+[fill]
+symbol = ' '
+
+[character]
+format = "$symbol "
+success_symbol = "[◎](bold italic bright-yellow)"
+error_symbol = "[○](italic purple)"
+vimcmd_symbol = "[■](italic dimmed green)"
+# not supported in zsh
+vimcmd_replace_one_symbol = "◌"
+vimcmd_replace_symbol = "□"
+vimcmd_visual_symbol = "▼"
+
+[env_var.VIMSHELL]
+format = "[$env_value]($style)"
+style = 'green italic'
+
+[sudo]
+format = "[$symbol]($style)"
+style = "bold italic bright-purple"
+symbol = "⋈┈"
+disabled = false
+
+[username]
+style_user = "bright-yellow bold italic"
+style_root = "purple bold italic"
+format = "[⭘ $user]($style) "
+disabled = false
+show_always = false
 
 [directory]
-style = "fg:#e3e5e5 bg:#769ff0"
-format = "[ $path ]($style)"
-truncation_length = 3
-truncation_symbol = "…/"
+home_symbol = "⌂"
+truncation_length = 2
+truncation_symbol = "□ "
+read_only = " ◈"
+use_os_path_sep = true
+style = "italic blue"
+format = '[$path]($style)[$read_only]($read_only_style)'
+repo_root_style = 'bold blue'
+repo_root_format = '[$before_root_path]($before_repo_root_style)[$repo_root]($repo_root_style)[$path]($style)[$read_only]($read_only_style) [△](bold bright-blue)'
 
-[directory.substitutions]
-"Documents" = "󰈙 "
-"Downloads" = " "
-"Music" = " "
-"Pictures" = " "
+[cmd_duration]
+format = "[◄ $duration ](italic white)"
 
-[git_branch]
-symbol = ""
-style = "bg:#394260"
-format = '[[ $symbol $branch ](fg:#769ff0 bg:#394260)]($style)'
+[jobs]
+format = "[$symbol$number]($style) "
+style = "white"
+symbol = "[▶](blue italic)"
 
-[git_status]
-style = "bg:#394260"
-format = '[[($all_status$ahead_behind )](fg:#769ff0 bg:#394260)]($style)'
-
-[nodejs]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[rust]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[golang]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[php]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[ruby]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[python]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($version) ](fg:#769ff0 bg:#212736)]($style)'
-
-[nix_shell]
-symbol = ""
-style = "bg:#212736"
-format = '[[ $symbol ($state) ](fg:#769ff0 bg:#212736)]($style)'
+[localip]
+ssh_only = true
+format = " ◯[$localipv4](bold magenta)"
+disabled = false
 
 [time]
 disabled = false
+format = "[ $time]($style)"
 time_format = "%R"
-style = "bg:#1d2230"
-format = '[[  $time ](fg:#a0a9cb bg:#1d2230)]($style)'
+utc_time_offset = "local"
+style = "italic dimmed white"
+
+[battery]
+format = "[ $percentage $symbol]($style)"
+full_symbol = "█"
+charging_symbol = "[↑](italic bold green)"
+discharging_symbol = "↓"
+unknown_symbol = "░"
+empty_symbol = "▃"
+
+[[battery.display]]
+threshold = 20
+style = "italic bold red"
+
+[[battery.display]]
+threshold = 60
+style = "italic dimmed bright-purple"
+
+[[battery.display]]
+threshold = 70
+style = "italic dimmed yellow"
+
+[git_branch]
+format = " [$branch(:$remote_branch)]($style)"
+symbol = "[△](bold italic bright-blue)"
+style = "italic bright-blue"
+truncation_symbol = "⋯"
+truncation_length = 11
+ignore_branches = ["main", "master"]
+only_attached = true
+
+[git_metrics]
+format = '([▴$added]($added_style))([▿$deleted]($deleted_style))'
+added_style = 'italic dimmed green'
+deleted_style = 'italic dimmed red'
+ignore_submodules = true
+disabled = false
+
+[git_status]
+style = "bold italic bright-blue"
+format = "([⎪$ahead_behind$staged$modified$untracked$renamed$deleted$conflicted$stashed⎥]($style))"
+conflicted = "[◪◦](italic bright-magenta)"
+ahead = "[▴│[${count}](bold white)│](italic green)"
+behind = "[▿│[${count}](bold white)│](italic red)"
+diverged = "[◇ ▴┤[${ahead_count}](regular white)│▿┤[${behind_count}](regular white)│](italic bright-magenta)"
+untracked = "[◌◦](italic bright-yellow)"
+stashed = "[◃◈](italic white)"
+modified = "[●◦](italic yellow)"
+staged = "[▪┤[$count](bold white)│](italic bright-cyan)"
+renamed = "[◎◦](italic bright-blue)"
+deleted = "[✕](italic red)"
+
+[deno]
+format = " [deno](italic) [∫ $version](green bold)"
+version_format = "${raw}"
+
+[lua]
+format = " [lua](italic) [${symbol}${version}]($style)"
+version_format = "${raw}"
+symbol = "⨀ "
+style = "bold bright-yellow"
+
+[nodejs]
+format = " [node](italic) [◫ ($version)](bold bright-green)"
+version_format = "${raw}"
+detect_files = ["package-lock.json", "yarn.lock"]
+detect_folders = ["node_modules"]
+detect_extensions = []
+
+[bun]
+format = " [bun](italic) [◫ ($version)](bold bright-green)"
+version_format = "${raw}"
+
+[python]
+format = " [py](italic) [${symbol}${version}]($style)"
+symbol = "[⌉](bold bright-blue)⌊ "
+version_format = "${raw}"
+style = "bold bright-yellow"
+
+[ruby]
+format = " [rb](italic) [${symbol}${version}]($style)"
+symbol = "◆ "
+version_format = "${raw}"
+style = "bold red"
+
+[rust]
+format = " [rs](italic) [$symbol$version]($style)"
+symbol = "⊃ "
+version_format = "${raw}"
+style = "bold red"
+
+[package]
+format = " [pkg](italic dimmed) [$symbol$version]($style)"
+version_format = "${raw}"
+symbol = "◨ "
+style = "dimmed yellow italic bold"
+
+[swift]
+format = " [sw](italic) [${symbol}${version}]($style)"
+symbol = "◁ "
+style = "bold bright-red"
+version_format = "${raw}"
+
+[aws]
+disabled = true
+format = " [aws](italic) [$symbol $profile $region]($style)"
+style = "bold blue"
+symbol = "▲ "
+
+[buf]
+symbol = "■ "
+format = " [buf](italic) [$symbol $version $buf_version]($style)"
+
+[c]
+symbol = "ℂ "
+format = " [$symbol($version(-$name))]($style)"
+
+[cpp]
+symbol = "ℂ "
+format = " [$symbol($version(-$name))]($style)"
+
+[conda]
+symbol = "◯ "
+format = " conda [$symbol$environment]($style)"
+
+[pixi]
+symbol = "■ "
+format = " pixi [$symbol$version ($environment )]($style)"
+
+[dart]
+symbol = "◁◅ "
+format = " dart [$symbol($version )]($style)"
+
+[docker_context]
+symbol = "◧ "
+format = " docker [$symbol$context]($style)"
+
+[elixir]
+symbol = "△ "
+format = " exs [$symbol $version OTP $otp_version ]($style)"
+
+[elm]
+symbol = "◩ "
+format = " elm [$symbol($version )]($style)"
+
+[golang]
+symbol = "∩ "
+format = " go [$symbol($version )]($style)"
+
+[haskell]
+symbol = "❯λ "
+format = " hs [$symbol($version )]($style)"
+
+[java]
+symbol = "∪ "
+format = " java [${symbol}(${version} )]($style)"
+
+[julia]
+symbol = "◎ "
+format = " jl [$symbol($version )]($style)"
+
+[memory_usage]
+symbol = "▪▫▪ "
+format = " mem [${ram}( ${swap})]($style)"
+
+[nim]
+symbol = "▴▲▴ "
+format = " nim [$symbol($version )]($style)"
+
+[nix_shell]
+style = 'bold italic dimmed blue'
+symbol = '✶'
+format = '[$symbol nix⎪$state⎪]($style) [$name](italic dimmed white)'
+impure_msg = '[⌽](bold dimmed red)'
+pure_msg = '[⌾](bold dimmed green)'
+unknown_msg = '[◌](bold dimmed yellow)'
+
+[spack]
+symbol = "◇ "
+format = " spack [$symbol$environment]($style)"
 `
 
+// TokyoNightStarshipTOML is a deprecated alias for JetpackStarshipTOML.
+const TokyoNightStarshipTOML = JetpackStarshipTOML
+
+// EnsureConfig initializes Orbit Machine shell configuration under homeDir using
+// <homeDir>/workspace as the default workspace directory.
+func EnsureConfig(homeDir string) error {
+	trimmed := strings.TrimSpace(homeDir)
+	if trimmed == "" {
+		return fmt.Errorf("%w: homeDir is required", domain.ErrInvalidConfig)
+	}
+	return EnsureInitialized(trimmed, filepath.Join(trimmed, "workspace"))
+}
+
 // EnsureInitialized creates standard Orbit Machine configuration directories,
-// writes ~/.config/starship.toml and ~/.config/direnv/direnv.toml if missing,
-// and ensures ~/.bashrc and ~/.bash_profile hook direnv, starship, and env.sh.
+// writes ~/.config/starship.toml (upgrading to the Jetpack preset if needed) and
+// ~/.config/direnv/direnv.toml if missing, and ensures ~/.bashrc and ~/.bash_profile
+// hook direnv, starship, env.sh, and the interactive welcome banner.
 func EnsureInitialized(homeDir, workDir string) error {
 	homeDir = strings.TrimSpace(homeDir)
 	workDir = strings.TrimSpace(workDir)
@@ -128,8 +398,9 @@ func EnsureInitialized(homeDir, workDir string) error {
 	}
 
 	starshipPath := filepath.Join(homeDir, ".config", "starship.toml")
-	if _, err := os.Stat(starshipPath); os.IsNotExist(err) {
-		if err := os.WriteFile(starshipPath, []byte(TokyoNightStarshipTOML), 0o644); err != nil {
+	existingStarship, starshipErr := os.ReadFile(starshipPath)
+	if starshipErr != nil || !strings.Contains(string(existingStarship), jetpackPresetHeader) {
+		if err := os.WriteFile(starshipPath, []byte(JetpackStarshipTOML), 0o644); err != nil {
 			return fmt.Errorf("writing starship.toml: %w", err)
 		}
 	}
@@ -144,18 +415,10 @@ func EnsureInitialized(homeDir, workDir string) error {
 
 	bashrcPath := filepath.Join(homeDir, ".bashrc")
 	existingBashrc, _ := os.ReadFile(bashrcPath)
-	if !strings.Contains(string(existingBashrc), bashrcMarkerStart) {
-		block := buildBashrcBlock(homeDir)
-		var updated strings.Builder
-		if len(existingBashrc) > 0 {
-			updated.Write(existingBashrc)
-			if !strings.HasSuffix(string(existingBashrc), "\n") {
-				updated.WriteByte('\n')
-			}
-			updated.WriteByte('\n')
-		}
-		updated.WriteString(block)
-		if err := os.WriteFile(bashrcPath, []byte(updated.String()), 0o644); err != nil {
+	block := buildBashrcBlock(homeDir)
+	updatedBashrc := upsertBashrcBlock(string(existingBashrc), block)
+	if updatedBashrc != string(existingBashrc) {
+		if err := os.WriteFile(bashrcPath, []byte(updatedBashrc), 0o644); err != nil {
 			return fmt.Errorf("writing .bashrc: %w", err)
 		}
 	}
@@ -172,11 +435,36 @@ func EnsureInitialized(homeDir, workDir string) error {
 	return nil
 }
 
+func upsertBashrcBlock(existing, block string) string {
+	for _, markers := range [][2]string{
+		{bashrcMarkerStart, bashrcMarkerEnd},
+		{altBashrcMarkerStart, altBashrcMarkerEnd},
+	} {
+		startIdx := strings.Index(existing, markers[0])
+		endIdx := strings.Index(existing, markers[1])
+		if startIdx >= 0 && endIdx > startIdx {
+			afterEnd := endIdx + len(markers[1])
+			if afterEnd < len(existing) && existing[afterEnd] == '\n' {
+				afterEnd++
+			}
+			return existing[:startIdx] + block + existing[afterEnd:]
+		}
+	}
+
+	var updated strings.Builder
+	if len(existing) > 0 {
+		updated.WriteString(existing)
+		if !strings.HasSuffix(existing, "\n") {
+			updated.WriteByte('\n')
+		}
+		updated.WriteByte('\n')
+	}
+	updated.WriteString(block)
+	return updated.String()
+}
+
 func buildDirenvTOML(workDir string) string {
 	const defaultWorkspace = "/home/orbit/workspace"
-	if filepath.Clean(workDir) == defaultWorkspace {
-		return fmt.Sprintf("[whitelist]\nprefix = [ %q ]\n", defaultWorkspace)
-	}
 	return fmt.Sprintf("[whitelist]\nprefix = [ %q, %q ]\n", defaultWorkspace, filepath.Clean(workDir))
 }
 
@@ -190,6 +478,18 @@ export TERM="${TERM:-xterm-256color}"
 [ -f %q ] && . %q
 command -v direnv >/dev/null 2>&1 && eval "$(direnv hook bash)"
 command -v starship >/dev/null 2>&1 && eval "$(starship init bash)"
+if [[ $- == *i* ]]; then
+  printf '\n\033[1;36m🪐 Welcome to Orbit Machine\033[0m\n'
+  printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n'
+  printf '  \033[1;33morbit\033[0m                    Launch interactive Orbit workspace & tool assistant\n'
+  printf '  \033[1;33morbit repos\033[0m              Fetch & clone workspace repositories\n'
+  printf '  \033[1;33morbit flake init [stack]\033[0m Initialize Nix flake + direnv .envrc\n'
+  printf '  \033[1;33morbit tools [tool...]\033[0m    Configure AI coding tools (claude, codex, gemini, opencode, cursor, aider)\n'
+  printf '  \033[1;33morbit git\033[0m                Configure Git author identity & defaults\n'
+  printf '  \033[1;33morbit ssh-key\033[0m            Generate or import your Git SSH key\n'
+  printf '  \033[1;33morbit status\033[0m             Show configured tools, Git, SSH key, and workspace status\n'
+  printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n\n'
+fi
 %s
 `, bashrcMarkerStart, starshipCfg, envSh, envSh, bashrcMarkerEnd)
 }
