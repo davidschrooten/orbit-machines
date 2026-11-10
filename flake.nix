@@ -16,7 +16,7 @@
           buildOrbitPackage = pname: subPackage:
             pkgs.buildGoModule {
               inherit pname;
-              version = "0.1.0";
+              version = "0.2.0";
               src = self;
               subPackages = [ subPackage ];
               vendorHash = null;
@@ -30,7 +30,7 @@
           orbit-helper = buildOrbitPackage "orbit-helper" "cmd/orbit-helper";
           default = pkgs.buildGoModule {
             pname = "orbit-machines";
-            version = "0.1.0";
+            version = "0.2.0";
             src = self;
             subPackages = [
               "cmd/orbit-dispatcher"

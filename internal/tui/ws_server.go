@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,8 +61,14 @@ func WithWorkspaceDir(dir string) WSServerOption {
 	return func(s *WSServer) {
 		if trimmed := strings.TrimSpace(dir); trimmed != "" {
 			s.workspaceDir = trimmed
+			s.persistTabs = true
 		}
 	}
+}
+
+type persistedTabsState struct {
+	ActiveTabs []string  `json:"active_tabs"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type wsClient struct {
@@ -85,6 +94,7 @@ type WSServer struct {
 	comp              *Compositor
 	shellSpawner      ShellSpawnerFunc
 	workspaceDir      string
+	persistTabs       bool
 	codec             *protocol.FrameCodec
 	tickInterval      time.Duration
 	keepaliveInterval time.Duration
@@ -92,9 +102,10 @@ type WSServer struct {
 	onContextUpdate   func(req ContextUpdateRequest) error
 	onSnapshot        func(ctx context.Context) ([]string, error)
 
-	mu      sync.Mutex
-	clients map[*wsClient]struct{}
-	tabs    map[string]*tabSession
+	mu            sync.Mutex
+	clients       map[*wsClient]struct{}
+	tabs          map[string]*tabSession
+	persistedTabs map[string]struct{}
 }
 
 // NewWSServer validates cfg and constructs a WSServer.
@@ -112,9 +123,11 @@ func NewWSServer(cfg WSServerConfig, opts ...WSServerOption) (*WSServer, error) 
 		keepalive = defaultKeepaliveInterval
 	}
 	wsDir := strings.TrimSpace(cfg.WorkspaceDir)
+	persistTabs := wsDir != ""
 	if wsDir == "" {
 		if envWork := strings.TrimSpace(os.Getenv("ORBIT_MACHINED_WORK_DIR")); envWork != "" {
 			wsDir = envWork
+			persistTabs = true
 		} else if envHome := strings.TrimSpace(os.Getenv("HOME")); envHome != "" {
 			wsDir = filepath.Join(envHome, "workspace")
 		} else {
@@ -125,6 +138,7 @@ func NewWSServer(cfg WSServerConfig, opts ...WSServerOption) (*WSServer, error) 
 		comp:              cfg.Compositor,
 		shellSpawner:      cfg.ShellSpawner,
 		workspaceDir:      wsDir,
+		persistTabs:       persistTabs,
 		codec:             codec,
 		tickInterval:      tick,
 		keepaliveInterval: keepalive,
@@ -133,21 +147,24 @@ func NewWSServer(cfg WSServerConfig, opts ...WSServerOption) (*WSServer, error) 
 		onSnapshot:        cfg.OnSnapshot,
 		clients:           make(map[*wsClient]struct{}),
 		tabs:              make(map[string]*tabSession),
+		persistedTabs:     make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(srv)
 		}
 	}
+	srv.loadPersistedTabsLocked()
 	return srv, nil
 }
 
-// Handler returns the HTTP handler serving GET /healthz, GET /ws, DELETE /api/v1/tabs/{tab_id},
-// POST /api/v1/context, POST /api/v1/snapshot, and POST /api/v1/upload.
+// Handler returns the HTTP handler serving GET /healthz, GET /ws, GET /api/v1/tabs,
+// DELETE /api/v1/tabs/{tab_id}, POST /api/v1/context, POST /api/v1/snapshot, and POST /api/v1/upload.
 func (s *WSServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /ws", s.handleWS)
+	mux.HandleFunc("GET /api/v1/tabs", s.handleListTabs)
 	mux.HandleFunc("DELETE /api/v1/tabs/{tab_id}", s.handleDeleteTab)
 	mux.HandleFunc("POST /api/v1/context", s.handleUpdateContext)
 	mux.HandleFunc("POST /api/v1/snapshot", s.handleSnapshot)
@@ -155,8 +172,32 @@ func (s *WSServer) Handler() http.Handler {
 	return mux
 }
 
-// Close terminates all active tab PTY sessions.
+// ActiveTabIDs returns all active and persisted tab IDs sorted by numeric suffix ("tab-1", "tab-2", ...).
+func (s *WSServer) ActiveTabIDs() []string {
+	s.mu.Lock()
+	seen := make(map[string]struct{}, len(s.tabs)+len(s.persistedTabs))
+	for id, ts := range s.tabs {
+		if ts != nil && !ts.pane.Exited() {
+			seen[id] = struct{}{}
+		}
+	}
+	for id := range s.persistedTabs {
+		seen[id] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sortTabIDs(out)
+	return out
+}
+
+// Close terminates all active tab PTY sessions after flushing their scrollback state to disk.
 func (s *WSServer) Close() error {
+	s.flushTabsToDisk()
+
 	s.mu.Lock()
 	tabs := make([]*tabSession, 0, len(s.tabs))
 	for _, ts := range s.tabs {
@@ -173,30 +214,43 @@ func (s *WSServer) Close() error {
 
 // CloseTab terminates and removes the PTY session for tabID.
 func (s *WSServer) CloseTab(tabID string) {
-	tabID = strings.TrimSpace(tabID)
+	tabID = sanitizeTabID(tabID)
 	if tabID == "" {
 		return
 	}
 	s.mu.Lock()
 	ts, ok := s.tabs[tabID]
 	delete(s.tabs, tabID)
+	_, wasPersisted := s.persistedTabs[tabID]
+	delete(s.persistedTabs, tabID)
 	s.mu.Unlock()
 
-	if !ok || ts == nil {
-		return
-	}
-	_ = ts.pane.Close()
+	s.removeTabScrollback(tabID)
+	s.saveTabsState()
 
-	ts.mu.Lock()
-	conns := make([]*wsClient, 0, len(ts.conns))
-	for c := range ts.conns {
-		conns = append(conns, c)
-	}
-	ts.conns = make(map[*wsClient]struct{})
-	ts.mu.Unlock()
+	if ok && ts != nil {
+		_ = ts.pane.Close()
 
-	for _, c := range conns {
-		_ = c.conn.CloseNow()
+		ts.mu.Lock()
+		conns := make([]*wsClient, 0, len(ts.conns))
+		for c := range ts.conns {
+			conns = append(conns, c)
+		}
+		ts.conns = make(map[*wsClient]struct{})
+		ts.mu.Unlock()
+
+		for _, c := range conns {
+			_ = c.conn.CloseNow()
+		}
+	}
+
+	if ok || wasPersisted {
+		_ = s.BroadcastMetadata(protocol.MetadataEvent{
+			Type:        protocol.MetaEventSessionState,
+			Phase:       domain.BootPhaseReady,
+			ActiveTabs:  s.ActiveTabIDs(),
+			ClosedTabID: tabID,
+		})
 	}
 }
 
@@ -227,14 +281,23 @@ func (s *WSServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
+func (s *WSServer) handleListTabs(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"active_tabs": s.ActiveTabIDs(),
+	})
+}
+
 func (s *WSServer) handleDeleteTab(w http.ResponseWriter, r *http.Request) {
 	tabID := strings.TrimSpace(r.PathValue("tab_id"))
 	s.CloseTab(tabID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status": "closed",
-		"tab_id": tabID,
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":      "closed",
+		"tab_id":      tabID,
+		"active_tabs": s.ActiveTabIDs(),
 	})
 }
 
@@ -256,6 +319,8 @@ func (s *WSServer) handleUpdateContext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WSServer) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	s.flushTabsToDisk()
+
 	var repos []string
 	if s.onSnapshot != nil {
 		snapRepos, err := s.onSnapshot(r.Context())
@@ -441,12 +506,12 @@ func (s *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WSServer) handleShellWS(r *http.Request, client *wsClient) {
-	tabID := strings.TrimSpace(r.URL.Query().Get("tab"))
+	tabID := sanitizeTabID(r.URL.Query().Get("tab"))
 	if tabID == "" {
 		tabID = "tab-1"
 	}
 
-	ts, err := s.getOrSpawnTab(tabID)
+	ts, created, err := s.getOrSpawnTab(tabID)
 	if err != nil {
 		_ = client.conn.Close(websocket.StatusInternalError, err.Error())
 		return
@@ -473,6 +538,19 @@ func (s *WSServer) handleShellWS(r *http.Request, client *wsClient) {
 	if len(scrollback) > 0 {
 		cols, rows := ts.pane.Size()
 		_ = ts.pane.Resize(cols, rows)
+	}
+
+	// Send current active_tabs session state to the connecting client and notify other clients if a new tab was spawned.
+	activeTabs := s.ActiveTabIDs()
+	if metaBytes, encErr := s.codec.EncodeMetadata(protocol.MetadataEvent{
+		Type:       protocol.MetaEventSessionState,
+		Phase:      domain.BootPhaseReady,
+		ActiveTabs: activeTabs,
+	}); encErr == nil {
+		_ = client.WriteBinary(ctx, metaBytes)
+		if created {
+			s.broadcastFrameExcept(metaBytes, client)
+		}
 	}
 
 	// Start periodic 20s FramePong keepalive so intermediate proxies/ingresses do not drop idle shells.
@@ -531,32 +609,205 @@ func (s *WSServer) keepaliveLoop(ctx context.Context, client *wsClient) {
 	}
 }
 
-func (s *WSServer) getOrSpawnTab(tabID string) (*tabSession, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *WSServer) getOrSpawnTab(tabID string) (*tabSession, bool, error) {
+	tabID = sanitizeTabID(tabID)
+	if tabID == "" {
+		tabID = "tab-1"
+	}
 
+	s.mu.Lock()
 	if existing, ok := s.tabs[tabID]; ok && existing != nil {
 		if !existing.pane.Exited() {
-			return existing, nil
+			s.persistedTabs[tabID] = struct{}{}
+			s.mu.Unlock()
+			return existing, false, nil
 		}
 		_ = existing.pane.Close()
 		delete(s.tabs, tabID)
 	}
 
+	var savedScrollback []byte
+	if s.persistTabs {
+		savedScrollback, _ = os.ReadFile(s.tabScrollbackPath(tabID))
+	}
+
 	pane, err := s.shellSpawner(context.Background(), tabID, 120, 36)
 	if err != nil {
-		return nil, err
+		s.mu.Unlock()
+		return nil, false, err
 	}
+	if len(savedScrollback) > 0 {
+		pane.PrependScrollback(savedScrollback)
+	}
+
+	_, wasPersisted := s.persistedTabs[tabID]
+	s.persistedTabs[tabID] = struct{}{}
 	ts := &tabSession{
 		id:    tabID,
 		pane:  pane,
 		conns: make(map[*wsClient]struct{}),
 	}
 	pane.SetOnOutput(func(chunk []byte) {
+		s.saveTabScrollback(tabID, ts.pane.Scrollback())
 		s.broadcastTabOutput(ts, chunk)
 	})
 	s.tabs[tabID] = ts
-	return ts, nil
+	initialScrollback := pane.Scrollback()
+	s.mu.Unlock()
+
+	s.saveTabScrollback(tabID, initialScrollback)
+	s.saveTabsState()
+	return ts, !wasPersisted, nil
+}
+
+func (s *WSServer) broadcastFrameExcept(frameBytes []byte, skip *wsClient) {
+	s.mu.Lock()
+	conns := make([]*wsClient, 0, len(s.clients))
+	for c := range s.clients {
+		if c != skip {
+			conns = append(conns, c)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, c := range conns {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = c.WriteBinary(ctx, frameBytes)
+		cancel()
+	}
+}
+
+func (s *WSServer) tabsStatePath() string {
+	return filepath.Join(s.workspaceDir, ".orbit", "tabs.json")
+}
+
+func (s *WSServer) tabScrollbackPath(tabID string) string {
+	return filepath.Join(s.workspaceDir, ".orbit", "tabs", sanitizeTabID(tabID)+".scrollback")
+}
+
+func (s *WSServer) loadPersistedTabsLocked() {
+	if !s.persistTabs {
+		return
+	}
+	raw, err := os.ReadFile(s.tabsStatePath())
+	if err != nil {
+		return
+	}
+	var state persistedTabsState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return
+	}
+	for _, id := range state.ActiveTabs {
+		if clean := sanitizeTabID(id); clean != "" {
+			s.persistedTabs[clean] = struct{}{}
+		}
+	}
+}
+
+func (s *WSServer) saveTabsState() {
+	if !s.persistTabs {
+		return
+	}
+	state := persistedTabsState{
+		ActiveTabs: s.ActiveTabIDs(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+	orbitDir := filepath.Join(s.workspaceDir, ".orbit")
+	if err := os.MkdirAll(orbitDir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(s.tabsStatePath(), raw, 0o644)
+}
+
+func (s *WSServer) saveTabScrollback(tabID string, data []byte) {
+	if !s.persistTabs || len(data) == 0 {
+		return
+	}
+	clean := sanitizeTabID(tabID)
+	if clean == "" {
+		return
+	}
+	tabsDir := filepath.Join(s.workspaceDir, ".orbit", "tabs")
+	if err := os.MkdirAll(tabsDir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(s.tabScrollbackPath(clean), data, 0o644)
+}
+
+func (s *WSServer) removeTabScrollback(tabID string) {
+	if !s.persistTabs {
+		return
+	}
+	clean := sanitizeTabID(tabID)
+	if clean == "" {
+		return
+	}
+	_ = os.Remove(s.tabScrollbackPath(clean))
+}
+
+func (s *WSServer) flushTabsToDisk() {
+	if !s.persistTabs {
+		return
+	}
+	s.mu.Lock()
+	snapshots := make(map[string][]byte, len(s.tabs))
+	for id, ts := range s.tabs {
+		if ts != nil && !ts.pane.Exited() {
+			snapshots[id] = ts.pane.Scrollback()
+		}
+	}
+	s.mu.Unlock()
+
+	for id, scrollback := range snapshots {
+		s.saveTabScrollback(id, scrollback)
+	}
+	s.saveTabsState()
+}
+
+func sanitizeTabID(tabID string) string {
+	trimmed := strings.TrimSpace(tabID)
+	if trimmed == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range trimmed {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func sortTabIDs(ids []string) {
+	slices.SortFunc(ids, func(a, b string) int {
+		na, oka := parseTabNumber(a)
+		nb, okb := parseTabNumber(b)
+		if oka && okb {
+			return cmp.Compare(na, nb)
+		}
+		if oka {
+			return -1
+		}
+		if okb {
+			return 1
+		}
+		return cmp.Compare(a, b)
+	})
+}
+
+func parseTabNumber(tabID string) (int, bool) {
+	if !strings.HasPrefix(tabID, "tab-") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(tabID, "tab-"))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func (s *WSServer) broadcastTabOutput(ts *tabSession, chunk []byte) {

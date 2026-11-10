@@ -195,6 +195,7 @@ const (
 	PhaseHydratingProfile BootPhase = "hydrating_profile"
 	PhaseEvaluatingFlake  BootPhase = "evaluating_flake"
 	PhaseReady            BootPhase = "ready"
+	BootPhaseReady        BootPhase = PhaseReady
 	PhaseStopping         BootPhase = "stopping"
 	PhaseStopped          BootPhase = "stopped"
 )

@@ -61,6 +61,8 @@ type MetadataEvent struct {
 	ActiveIssue  string            `json:"active_issue,omitempty"`
 	IdleSeconds  int               `json:"idle_seconds,omitempty"`
 	HasWIPBundle bool              `json:"has_wip_bundle,omitempty"`
+	ActiveTabs   []string          `json:"active_tabs,omitempty"`
+	ClosedTabID  string            `json:"closed_tab_id,omitempty"`
 }
 
 // DecodedFrame represents a parsed binary WebSocket message.

@@ -19,7 +19,7 @@ import (
 )
 
 // Version is the semantic version of orbit-helper.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // ManagerFactory constructs a helper.Manager from CLI paths.
 type ManagerFactory func(homeDir, workDir, machinedURL string) (*helper.Manager, error)

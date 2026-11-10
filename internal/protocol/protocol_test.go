@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/davidschrooten/orbit-machines/internal/domain"
@@ -140,6 +141,8 @@ func TestFrameCodec_RoundTrips(t *testing.T) {
 			ProgressPct: 45,
 			ActiveRepo:  "orbit",
 			IdleSeconds: 0,
+			ActiveTabs:  []string{"tab-1", "tab-2"},
+			ClosedTabID: "tab-3",
 		}
 		wire, err := codec.EncodeMetadata(meta)
 		if err != nil {
@@ -149,7 +152,7 @@ func TestFrameCodec_RoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decode metadata error: %v", err)
 		}
-		if dec.Type != protocol.FrameMetadata || dec.Metadata == nil || *dec.Metadata != meta {
+		if dec.Type != protocol.FrameMetadata || dec.Metadata == nil || !reflect.DeepEqual(*dec.Metadata, meta) {
 			t.Errorf("decoded metadata = %+v, want %+v", dec.Metadata, meta)
 		}
 	})

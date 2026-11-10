@@ -31,7 +31,7 @@ import (
 )
 
 // Version is the semantic version of orbit-machined.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Runners holds injectable subcommand entrypoints for testing and composition.
 type Runners struct {
