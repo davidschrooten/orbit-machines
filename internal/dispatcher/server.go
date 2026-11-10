@@ -196,8 +196,9 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	connID := s.registerActiveSession(mid, sessCancel)
 	defer s.unregisterActiveSession(mid, connID)
 
+	effectiveOrbitURL := s.resolveEffectiveOrbitURL(claims, r)
 	var (
-		mcpToken  string
+		mcpToken  = strings.TrimSpace(claims.MCPToken)
 		repos     []protocol.RepoCredential
 		reposJSON string
 	)
@@ -213,7 +214,9 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		if credErr == nil {
-			mcpToken = creds.OrbitMCPToken
+			if minted := strings.TrimSpace(creds.OrbitMCPToken); minted != "" {
+				mcpToken = minted
+			}
 			repos = creds.Repositories
 			if len(repos) > 0 {
 				if raw, mErr := json.Marshal(repos); mErr == nil {
@@ -229,7 +232,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		UserEmail:               claims.UserLogin,
 		Tier:                    claims.Tier,
 		ProfileEncryptionKeyHex: s.deriveProfileKeyHex(mid),
-		OrbitURL:                s.orbitURL,
+		OrbitURL:                effectiveOrbitURL,
 		OrbitMCPToken:           mcpToken,
 		RepositoriesJSON:        reposJSON,
 	}); err != nil {
@@ -254,7 +257,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.setPodEndpoint(mid, ep)
-	s.pushPodContext(sessCtx, ep, mid, claims, mcpToken, repos)
+	s.pushPodContext(sessCtx, ep, mid, claims, effectiveOrbitURL, mcpToken, repos)
 
 	podWSURL := appendTabQuery(ep.WebSocketURL, r.URL.Query().Get("tab"))
 	podConn, err := dialPodWebSocket(sessCtx, podWSURL)
@@ -282,13 +285,35 @@ func appendTabQuery(wsURL, tab string) string {
 	return wsURL + sep + "tab=" + url.QueryEscape(tab)
 }
 
-func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid domain.MachineID, claims ticket.Claims, mcpToken string, repos []protocol.RepoCredential) {
+func isHTTPURL(raw string) bool {
+	u := strings.ToLower(strings.TrimSpace(raw))
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
+}
+
+func isPlaceholderDispatcherOrbitURL(raw string) bool {
+	u := strings.ToLower(strings.TrimSpace(raw))
+	return u == "" || strings.Contains(u, "orbit.example.com") || strings.Contains(u, "localhost")
+}
+
+func (s *Server) resolveEffectiveOrbitURL(claims ticket.Claims, r *http.Request) string {
+	if isHTTPURL(claims.OrbitURL) {
+		return strings.TrimRight(strings.TrimSpace(claims.OrbitURL), "/")
+	}
+	if isPlaceholderDispatcherOrbitURL(s.orbitURL) && r != nil {
+		if origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/"); isHTTPURL(origin) {
+			return origin
+		}
+	}
+	return s.orbitURL
+}
+
+func (s *Server) pushPodContext(ctx context.Context, ep k8s.PodEndpoint, mid domain.MachineID, claims ticket.Claims, orbitURL, mcpToken string, repos []protocol.RepoCredential) {
 	targetURL := podEndpointURL(ep, "/api/v1/context")
-	if targetURL == "" || (mcpToken == "" && len(repos) == 0 && s.orbitURL == "") {
+	if targetURL == "" || (mcpToken == "" && len(repos) == 0 && orbitURL == "") {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{
-		"orbit_url":       s.orbitURL,
+		"orbit_url":       orbitURL,
 		"orbit_mcp_token": mcpToken,
 		"workspace_id":    mid.WorkspaceID(),
 		"workspace_slug":  claims.WorkspaceSlug,

@@ -61,7 +61,9 @@ func TestMachinedCLI_Commands(t *testing.T) {
 		tmpHome := filepath.Join(t.TempDir(), "orbit-home")
 		tmpWork := filepath.Join(tmpHome, "workspace")
 		t.Setenv("ORBIT_MACHINED_HOME_DIR", tmpHome)
-		t.Setenv("ORBIT_MCP_TOKEN", "omcp_tok_boot")
+		t.Setenv("ORBIT_URL", "https://orbit.acme.dev")
+		t.Setenv("ORBIT_WORKSPACE_SLUG", "acme")
+		t.Setenv("ORBIT_MCP_TOKEN", "")
 		args := []string{
 			"serve",
 			"--listen-addr=127.0.0.1:0",
@@ -72,6 +74,17 @@ func TestMachinedCLI_Commands(t *testing.T) {
 		code := run(ctx, args, &out, &errOut, Runners{})
 		if code != 0 {
 			t.Fatalf("run(serve default) code = %d, stderr = %s", code, errOut.String())
+		}
+		// Verify default MCP configs were wired even when ORBIT_MCP_TOKEN was empty at boot
+		for _, p := range []string{
+			filepath.Join(tmpHome, ".claude.json"),
+			filepath.Join(tmpHome, ".gemini", "config", "mcp_config.json"),
+			filepath.Join(tmpHome, ".config", "opencode", "opencode.json"),
+		} {
+			raw, readErr := os.ReadFile(p)
+			if readErr != nil || !strings.Contains(string(raw), "https://orbit.acme.dev/api/v1/workspaces/acme/mcp") {
+				t.Fatalf("expected %s to contain workspace MCP URL after serve boot, got (%q, %v)", p, string(raw), readErr)
+			}
 		}
 		t.Setenv("ORBIT_MACHINED_HOME_DIR", "")
 		_ = resolveHomeDir(tmpWork)
@@ -87,7 +100,12 @@ func TestMachinedCLI_Commands(t *testing.T) {
 		_ = applyContextUpdate(mgr, tui.ContextUpdateRequest{
 			OrbitURL:      "https://orbit.acme.dev",
 			OrbitMCPToken: "omcp_tok_updated",
+			WorkspaceSlug: "acme",
 		})
+		updatedClaude, _ := os.ReadFile(filepath.Join(tmpHome, ".claude.json"))
+		if !strings.Contains(string(updatedClaude), "Bearer omcp_tok_updated") {
+			t.Fatalf("expected applyContextUpdate to update .claude.json with Bearer token, got:\n%s", string(updatedClaude))
+		}
 	})
 
 	t.Run("serve subcommand fails on missing required flags", func(t *testing.T) {

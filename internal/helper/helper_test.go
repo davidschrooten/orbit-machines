@@ -209,7 +209,7 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 
 	// Verify .claude.json contains the Orbit MCP URL and Bearer token, and gh config uses ssh protocol
 	claudeBytes, _ := os.ReadFile(filepath.Join(homeDir, ".claude.json"))
-	if !strings.Contains(string(claudeBytes), "https://orbit.acme.dev/mcp") || !strings.Contains(string(claudeBytes), "Bearer omcp_secret_123") {
+	if !strings.Contains(string(claudeBytes), "https://orbit.acme.dev/api/v1/workspaces/acme/mcp") || !strings.Contains(string(claudeBytes), "Bearer omcp_secret_123") {
 		t.Fatalf("unexpected .claude.json:\n%s", string(claudeBytes))
 	}
 	ghBytes, _ := os.ReadFile(filepath.Join(homeDir, ".config", "gh", "config.yml"))
@@ -754,7 +754,7 @@ func TestManager_ToolInstallerAndSystemPackages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(.claude.json): %v", err)
 	}
-	for _, needle := range []string{`"theme": "dark"`, `"hasCompletedOnboarding": true`, `"github"`, `"orbit"`, `"https://orbit.acme.dev/mcp"`, `"Bearer omcp_tok_tools"`} {
+	for _, needle := range []string{`"theme": "dark"`, `"hasCompletedOnboarding": true`, `"github"`, `"orbit"`, `"https://orbit.acme.dev/api/v1/mcp"`, `"Bearer omcp_tok_tools"`} {
 		if !strings.Contains(string(claudeData), needle) {
 			t.Errorf(".claude.json missing %q:\n%s", needle, string(claudeData))
 		}
@@ -765,7 +765,7 @@ func TestManager_ToolInstallerAndSystemPackages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(.gemini/config/mcp_config.json): %v", err)
 	}
-	for _, needle := range []string{`"existing"`, `"orbit"`, `"https://orbit.acme.dev/mcp"`} {
+	for _, needle := range []string{`"existing"`, `"orbit"`, `"https://orbit.acme.dev/api/v1/mcp"`} {
 		if !strings.Contains(string(agyMCPData), needle) {
 			t.Errorf(".gemini/config/mcp_config.json missing %q:\n%s", needle, string(agyMCPData))
 		}
@@ -1035,5 +1035,131 @@ func TestManager_AIStateAndConversationsPersistAcrossPodRestart(t *testing.T) {
 	// Verify OpenCode auth and session in ~/.local/share/opencode
 	if got, err := os.ReadFile(filepath.Join(homeDir2, ".local", "share", "opencode", "project", "my-repo", "session.json")); err != nil || string(got) != `{"messages":4}` {
 		t.Fatalf("Pod 2 opencode session = (%q, %v)", string(got), err)
+	}
+}
+
+func TestBuildMCPServerURL_SyncToolMCPConfigs_AndPlaceholderResolution(t *testing.T) {
+	// 1. BuildMCPServerURL normalization and idempotency
+	urlCases := []struct {
+		orbitURL string
+		slug     string
+		want     string
+	}{
+		{"", "", "http://localhost:3000/api/v1/mcp"},
+		{"", "acme", "http://localhost:3000/api/v1/workspaces/acme/mcp"},
+		{"https://orbit.acme.dev/", "acme", "https://orbit.acme.dev/api/v1/workspaces/acme/mcp"},
+		{"https://orbit.acme.dev/mcp", "acme", "https://orbit.acme.dev/api/v1/workspaces/acme/mcp"},
+		{"https://orbit.acme.dev/api/v1/mcp", "acme", "https://orbit.acme.dev/api/v1/workspaces/acme/mcp"},
+		{"https://orbit.acme.dev/api/v1/workspaces/old/mcp", "acme", "https://orbit.acme.dev/api/v1/workspaces/acme/mcp"},
+		{"https://orbit.acme.dev/api/v1/workspaces/acme/mcp/", "", "https://orbit.acme.dev/api/v1/mcp"},
+	}
+	for _, tc := range urlCases {
+		if got := helper.BuildMCPServerURL(tc.orbitURL, tc.slug); got != tc.want {
+			t.Fatalf("BuildMCPServerURL(%q, %q) = %q, want %q", tc.orbitURL, tc.slug, got, tc.want)
+		}
+		// Idempotency
+		if got2 := helper.BuildMCPServerURL(tc.want, tc.slug); got2 != tc.want {
+			t.Fatalf("BuildMCPServerURL idempotency(%q, %q) = %q, want %q", tc.want, tc.slug, got2, tc.want)
+		}
+	}
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	workDir := filepath.Join(homeDir, "workspace")
+
+	// Pre-create a repo with a stale .mcp.json pointing to /mcp, a .claude.json with a nested project orbit server, and an opencode.json with legacy "mcpServers"
+	repoDir := filepath.Join(workDir, "orbit-app")
+	_ = os.MkdirAll(repoDir, 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".mcp.json"), []byte(`{"mcpServers":{"orbit":{"type":"http","url":"https://orbit.example.com/mcp"},"other":{"url":"https://other.local"}}}`), 0o600)
+	_ = os.MkdirAll(homeDir, 0o755)
+	_ = os.WriteFile(filepath.Join(homeDir, ".claude.json"), []byte(`{"projects":{"/home/orbit/workspace/orbit-app":{"mcpServers":{"orbit":{"type":"http","url":"https://orbit.example.com/mcp"}}}}}`), 0o600)
+	_ = os.MkdirAll(filepath.Join(homeDir, ".config", "opencode"), 0o755)
+	_ = os.WriteFile(filepath.Join(homeDir, ".config", "opencode", "opencode.json"), []byte(`{"theme":"tokyonight","mcpServers":{"orbit":{"type":"http","url":"https://orbit.example.com/mcp"},"custom":{"type":"remote","url":"https://custom.local","enabled":true}}}`), 0o600)
+
+	mgr, err := helper.NewManager(helper.Config{
+		HomeDir:       homeDir,
+		WorkDir:       workDir,
+		ToolInstaller: helper.NoopToolInstaller,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// 2. SaveContext with placeholder URL, then real URL, then placeholder URL -> real URL preserved
+	_ = mgr.SaveContext(helper.OrbitContext{
+		OrbitURL:      "https://orbit.example.com",
+		WorkspaceSlug: "orbit-hq",
+	})
+	t.Setenv("ORBIT_URL", "https://orbit.real-from-env.dev")
+	envLoaded, _ := mgr.LoadContext()
+	if envLoaded.OrbitURL != "https://orbit.real-from-env.dev" {
+		t.Fatalf("expected LoadContext to replace placeholder OrbitURL with real ORBIT_URL env, got %q", envLoaded.OrbitURL)
+	}
+	t.Setenv("ORBIT_URL", "")
+
+	_ = mgr.SaveContext(helper.OrbitContext{
+		OrbitURL:      "https://orbit.production.dev",
+		OrbitMCPToken: "omcp_live_999",
+		WorkspaceSlug: "orbit-hq",
+	})
+	// Saving a placeholder URL afterwards must NOT clobber the real URL
+	_ = mgr.SaveContext(helper.OrbitContext{
+		OrbitURL: "https://orbit.example.com",
+	})
+	savedCtx, _ := mgr.LoadContext()
+	if savedCtx.OrbitURL != "https://orbit.production.dev" {
+		t.Fatalf("expected SaveContext to preserve real OrbitURL over placeholder, got %q", savedCtx.OrbitURL)
+	}
+
+	wantMCPURL := "https://orbit.production.dev/api/v1/workspaces/orbit-hq/mcp"
+
+	// 3. Verify OpenCode config uses top-level "mcp" with "type": "remote", "enabled": true, and removed "mcpServers"
+	ocBytes, err := os.ReadFile(filepath.Join(homeDir, ".config", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json): %v", err)
+	}
+	var ocDoc map[string]any
+	if err := json.Unmarshal(ocBytes, &ocDoc); err != nil {
+		t.Fatalf("Unmarshal(opencode.json): %v", err)
+	}
+	if _, hasLegacy := ocDoc["mcpServers"]; hasLegacy {
+		t.Fatalf("expected opencode.json to remove invalid top-level mcpServers key:\n%s", string(ocBytes))
+	}
+	if ocDoc["$schema"] != "https://opencode.ai/config.json" || ocDoc["theme"] != "tokyonight" {
+		t.Fatalf("unexpected top-level keys in opencode.json:\n%s", string(ocBytes))
+	}
+	mcpMap, _ := ocDoc["mcp"].(map[string]any)
+	orbitEntry, _ := mcpMap["orbit"].(map[string]any)
+	if orbitEntry["type"] != "remote" || orbitEntry["url"] != wantMCPURL || orbitEntry["enabled"] != true {
+		t.Fatalf("unexpected opencode mcp.orbit entry: %+v", orbitEntry)
+	}
+	if _, hasCustom := mcpMap["custom"]; !hasCustom {
+		t.Fatalf("expected opencode.json to migrate non-orbit entry from mcpServers to mcp: %+v", mcpMap)
+	}
+
+	// 4. Verify Antigravity CLI ~/.gemini/config/mcp_config.json (includes serverUrl & disabled:false) and Claude ~/.claude.json (including nested project repair)
+	agyRaw, err := os.ReadFile(filepath.Join(homeDir, ".gemini", "config", "mcp_config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(mcp_config.json): %v", err)
+	}
+	for _, needle := range []string{`"serverUrl": "` + wantMCPURL + `"`, `"url": "` + wantMCPURL + `"`, `"disabled": false`, `"Bearer omcp_live_999"`} {
+		if !strings.Contains(string(agyRaw), needle) {
+			t.Fatalf("expected mcp_config.json to contain %s, got:\n%s", needle, string(agyRaw))
+		}
+	}
+	claudeRaw, err := os.ReadFile(filepath.Join(homeDir, ".claude.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(.claude.json): %v", err)
+	}
+	if strings.Contains(string(claudeRaw), "https://orbit.example.com/mcp") || !strings.Contains(string(claudeRaw), wantMCPURL) {
+		t.Fatalf("expected .claude.json (including nested projects) to be updated to %s, got:\n%s", wantMCPURL, string(claudeRaw))
+	}
+
+	// 5. Verify workspace repo .mcp.json was automatically repaired with the new URL and token while preserving "other"
+	repoMCPBytes, err := os.ReadFile(filepath.Join(repoDir, ".mcp.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(repo .mcp.json): %v", err)
+	}
+	if !strings.Contains(string(repoMCPBytes), wantMCPURL) || !strings.Contains(string(repoMCPBytes), `"other"`) {
+		t.Fatalf("expected repo .mcp.json to be repaired to %s and preserve 'other', got:\n%s", wantMCPURL, string(repoMCPBytes))
 	}
 }
