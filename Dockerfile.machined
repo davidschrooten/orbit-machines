@@ -58,6 +58,13 @@ RUN ln -sf /usr/local/bin/orbit-helper /usr/local/bin/orbit && \
 ENV HOME=/home/orbit \
     USER=orbit \
     SHELL=/bin/bash \
+    XDG_CONFIG_HOME=/home/orbit/.config \
+    XDG_DATA_HOME=/home/orbit/.local/share \
+    XDG_STATE_HOME=/home/orbit/.local/state \
+    XDG_CACHE_HOME=/home/orbit/.cache \
+    HISTFILE=/home/orbit/.bash_history \
+    HISTSIZE=10000 \
+    HISTFILESIZE=20000 \
     NPM_CONFIG_PREFIX=/home/orbit/.local \
     PATH=/home/orbit/.local/bin:/home/orbit/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin \
     NIX_PATH=nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs:/nix/var/nix/profiles/per-user/root/channels \

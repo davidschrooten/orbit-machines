@@ -22,6 +22,7 @@ import (
 	"github.com/davidschrooten/orbit-machines/internal/domain"
 	"github.com/davidschrooten/orbit-machines/internal/helper"
 	"github.com/davidschrooten/orbit-machines/internal/protocol"
+	"github.com/davidschrooten/orbit-machines/internal/shellinit"
 )
 
 func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
@@ -193,7 +194,6 @@ func TestManager_ContextPersistenceReposCloneFlakeToolsAndSave(t *testing.T) {
 		filepath.Join(homeDir, ".claude.json"),
 		filepath.Join(homeDir, ".claude", "settings.json"),
 		filepath.Join(homeDir, ".gemini", "config", "mcp_config.json"),
-		filepath.Join(homeDir, ".gemini", "antigravity-cli", "settings.json"),
 		filepath.Join(homeDir, ".config", "antigravity", "mcp.json"),
 		filepath.Join(homeDir, ".gemini", "settings.json"),
 		filepath.Join(homeDir, ".config", "opencode", "config.json"),
@@ -934,5 +934,106 @@ echo '{"legacyPackages.x86_64-linux.ripgrep":{"pname":"ripgrep","version":"14.1.
 	results, err := mgr.SearchNixPackages(context.Background(), "ripgrep")
 	if err != nil || len(results) != 1 || results[0].Attribute != "ripgrep" {
 		t.Fatalf("default SearchNixPackages = %+v, err=%v", results, err)
+	}
+}
+
+func TestManager_AIStateAndConversationsPersistAcrossPodRestart(t *testing.T) {
+	t.Parallel()
+
+	workDir := filepath.Join(t.TempDir(), "workspace-pvc")
+	homeDir1 := filepath.Join(t.TempDir(), "pod1-home")
+
+	mgr1, err := helper.NewManager(helper.Config{
+		HomeDir:       homeDir1,
+		WorkDir:       workDir,
+		ToolInstaller: helper.NoopToolInstaller,
+	})
+	if err != nil {
+		t.Fatalf("Pod 1 NewManager: %v", err)
+	}
+	_ = mgr1.SaveContext(helper.OrbitContext{
+		OrbitURL:      "https://orbit.acme.dev",
+		OrbitMCPToken: "omcp_tok_pod1",
+	})
+	if _, err := mgr1.ConfigureTools(helper.SupportedTools); err != nil {
+		t.Fatalf("Pod 1 ConfigureTools: %v", err)
+	}
+
+	// Simulate user logging in and conversing in a repo with Claude Code, Antigravity CLI, and OpenCode in Pod 1
+	_ = os.MkdirAll(filepath.Join(homeDir1, ".claude", "projects", "-home-orbit-workspace-my-repo"), 0o700)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"sk-ant-pod1"}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".claude", "projects", "-home-orbit-workspace-my-repo", "session-1.jsonl"), []byte("{\"role\":\"user\",\"content\":\"hello\"}\n"), 0o600)
+
+	// Claude Code atomically replaces ~/.claude.json via rename
+	claudeLoginDoc := `{"oauthAccount":{"accountUuid":"acc_999","emailAddress":"alice@acme.dev"},"hasCompletedOnboarding":true,"projects":{"/home/orbit/workspace/my-repo":{"lastSessionId":"session-1"}}}`
+	tmpClaude := filepath.Join(homeDir1, ".claude.json.tmp.1")
+	_ = os.WriteFile(tmpClaude, []byte(claudeLoginDoc), 0o600)
+	_ = os.Rename(tmpClaude, filepath.Join(homeDir1, ".claude.json"))
+
+	// Antigravity CLI stores OAuth token, custom settings.json, and conversations
+	_ = os.MkdirAll(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "conversations"), 0o700)
+	_ = os.MkdirAll(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "brain", "conv-1"), 0o700)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "antigravity-oauth-token"), []byte("ya29.antigravity-token"), 0o600)
+	customAgySettings := "{\n  \"theme\": \"jetpack\",\n  \"autoApprove\": true\n}\n"
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "settings.json"), []byte(customAgySettings), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "conversations", "conv-1.pb"), []byte("PB_CONV_1"), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "brain", "conv-1", "transcript.jsonl"), []byte("{\"step\":1}\n"), 0o600)
+
+	// OpenCode stores auth and repo session in ~/.local/share/opencode
+	_ = os.MkdirAll(filepath.Join(homeDir1, ".local", "share", "opencode", "project", "my-repo"), 0o700)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".local", "share", "opencode", "auth.json"), []byte(`{"token":"oc-tok"}`), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".local", "share", "opencode", "project", "my-repo", "session.json"), []byte(`{"messages":4}`), 0o600)
+
+	shellinit.SyncPersistentHomeFiles(homeDir1, workDir)
+
+	// Pod 1 is destroyed
+	_ = os.RemoveAll(homeDir1)
+
+	// Pod 2 boots with brand-new ephemeral homeDir2 and the same persistent workDir
+	homeDir2 := filepath.Join(t.TempDir(), "pod2-home")
+	mgr2, err := helper.NewManager(helper.Config{
+		HomeDir:       homeDir2,
+		WorkDir:       workDir,
+		ToolInstaller: helper.NoopToolInstaller,
+	})
+	if err != nil {
+		t.Fatalf("Pod 2 NewManager: %v", err)
+	}
+	_ = mgr2.SaveContext(helper.OrbitContext{
+		OrbitURL:      "https://orbit.acme.dev",
+		OrbitMCPToken: "omcp_tok_pod2",
+	})
+	if _, err := mgr2.ConfigureTools(helper.SupportedTools); err != nil {
+		t.Fatalf("Pod 2 ConfigureTools: %v", err)
+	}
+
+	// Verify Claude Code credentials, repo conversation history, AND merged .claude.json (with oauthAccount + projects + new MCP token)
+	gotClaudeJSON, err := os.ReadFile(filepath.Join(homeDir2, ".claude.json"))
+	if err != nil {
+		t.Fatalf("Pod 2 ReadFile(.claude.json): %v", err)
+	}
+	for _, needle := range []string{`"acc_999"`, `"/home/orbit/workspace/my-repo"`, `"session-1"`, `"Bearer omcp_tok_pod2"`} {
+		if !strings.Contains(string(gotClaudeJSON), needle) {
+			t.Errorf("Pod 2 .claude.json missing %s:\n%s", needle, string(gotClaudeJSON))
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(homeDir2, ".claude", "projects", "-home-orbit-workspace-my-repo", "session-1.jsonl")); err != nil || string(got) != "{\"role\":\"user\",\"content\":\"hello\"}\n" {
+		t.Fatalf("Pod 2 Claude repo session = (%q, %v)", string(got), err)
+	}
+
+	// Verify Antigravity CLI OAuth token, conversation history, MCP config, AND untouched settings.json!
+	if got, err := os.ReadFile(filepath.Join(homeDir2, ".gemini", "antigravity-cli", "antigravity-oauth-token")); err != nil || string(got) != "ya29.antigravity-token" {
+		t.Fatalf("Pod 2 agy oauth token = (%q, %v)", string(got), err)
+	}
+	if got, err := os.ReadFile(filepath.Join(homeDir2, ".gemini", "antigravity-cli", "settings.json")); err != nil || string(got) != customAgySettings {
+		t.Fatalf("Pod 2 agy settings.json should be untouched, got (%q, %v)", string(got), err)
+	}
+	if got, err := os.ReadFile(filepath.Join(homeDir2, ".gemini", "config", "mcp_config.json")); err != nil || !strings.Contains(string(got), "Bearer omcp_tok_pod2") {
+		t.Fatalf("Pod 2 .gemini/config/mcp_config.json missing MCP token: (%q, %v)", string(got), err)
+	}
+
+	// Verify OpenCode auth and session in ~/.local/share/opencode
+	if got, err := os.ReadFile(filepath.Join(homeDir2, ".local", "share", "opencode", "project", "my-repo", "session.json")); err != nil || string(got) != `{"messages":4}` {
+		t.Fatalf("Pod 2 opencode session = (%q, %v)", string(got), err)
 	}
 }

@@ -40,17 +40,26 @@ const magicHeader = "ORBM"
 var DefaultProfileWhitelist = []string{
 	".ssh",
 	".gitconfig",
+	".git-credentials",
+	".bash_history",
 	".config/orbit",
 	".config/orbit-machine",
 	".config/gh",
 	".config/antigravity",
+	".config/antigravity-cli",
 	".claude",
 	".claude.json",
 	".config/opencode",
+	".local/share/opencode",
+	".local/state/opencode",
+	".opencode",
 	".codex",
 	".cursor",
+	".aider",
 	".aider.conf.yml",
 	".gemini",
+	".antigravity",
+	".antigravity-cli",
 	".local/bin",
 }
 
@@ -321,24 +330,69 @@ func (v *ProfileVault) SnapshotProfile(ctx context.Context, mid domain.MachineID
 
 	for _, relRoot := range DefaultProfileWhitelist {
 		absRoot := filepath.Join(homeDir, relRoot)
-		if _, err := os.Stat(absRoot); errors.Is(err, os.ErrNotExist) {
+		evalRoot, err := filepath.EvalSymlinks(absRoot)
+		if err != nil {
 			continue
 		}
-		err := filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil || d.IsDir() || !d.Type().IsRegular() {
+		info, err := os.Stat(evalRoot)
+		if err != nil {
+			continue
+		}
+		if info.Mode().IsRegular() {
+			data, err := os.ReadFile(evalRoot)
+			if err != nil {
+				return err
+			}
+			_ = tw.WriteHeader(&tar.Header{
+				Name:     filepath.ToSlash(relRoot),
+				Mode:     int64(info.Mode().Perm()),
+				Size:     int64(len(data)),
+				ModTime:  info.ModTime(),
+				Typeflag: tar.TypeReg,
+			})
+			_, _ = tw.Write(data)
+			continue
+		}
+		if !info.IsDir() {
+			continue
+		}
+		err = filepath.WalkDir(evalRoot, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
 				return walkErr
 			}
-			relPath, _ := filepath.Rel(homeDir, path)
-			info, _ := d.Info()
+			var fileInfo fs.FileInfo
+			if d.Type()&os.ModeSymlink != 0 {
+				resolved, rErr := filepath.EvalSymlinks(path)
+				if rErr != nil {
+					return nil
+				}
+				st, sErr := os.Stat(resolved)
+				if sErr != nil || !st.Mode().IsRegular() {
+					return nil
+				}
+				fileInfo = st
+			} else if d.Type().IsRegular() {
+				fileInfo, _ = d.Info()
+			} else {
+				return nil
+			}
+			if fileInfo == nil {
+				return nil
+			}
+			subRel, relErr := filepath.Rel(evalRoot, path)
+			if relErr != nil || subRel == "." {
+				return relErr
+			}
+			archiveName := filepath.ToSlash(filepath.Join(relRoot, subRel))
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
 			_ = tw.WriteHeader(&tar.Header{
-				Name:     filepath.ToSlash(relPath),
-				Mode:     int64(info.Mode().Perm()),
+				Name:     archiveName,
+				Mode:     int64(fileInfo.Mode().Perm()),
 				Size:     int64(len(data)),
-				ModTime:  info.ModTime(),
+				ModTime:  fileInfo.ModTime(),
 				Typeflag: tar.TypeReg,
 			})
 			_, _ = tw.Write(data)
