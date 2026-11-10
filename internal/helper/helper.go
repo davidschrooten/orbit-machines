@@ -76,6 +76,41 @@ type OrbitContext struct {
 	Repositories  []protocol.RepoCredential `json:"repositories"`
 }
 
+// Context is an alias for OrbitContext.
+type Context = OrbitContext
+
+// BuildMCPServerURL constructs the Orbit Streamable HTTP JSON-RPC MCP endpoint URL.
+// When workspaceSlug is non-empty, it returns <baseURL>/api/v1/workspaces/<workspaceSlug>/mcp;
+// otherwise it returns <baseURL>/api/v1/mcp.
+func BuildMCPServerURL(orbitURL, workspaceSlug string) string {
+	base := strings.TrimRight(strings.TrimSpace(orbitURL), "/")
+	if base == "" {
+		base = "http://localhost:3000"
+	}
+	if idx := strings.Index(base, "/api/v1/workspaces/"); idx > 0 && strings.HasSuffix(base, "/mcp") {
+		base = strings.TrimRight(base[:idx], "/")
+	}
+	base = strings.TrimSuffix(base, "/api/v1/mcp")
+	base = strings.TrimSuffix(base, "/mcp")
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		base = "http://localhost:3000"
+	}
+	slug := strings.Trim(strings.TrimSpace(workspaceSlug), "/")
+	if slug != "" {
+		return base + "/api/v1/workspaces/" + slug + "/mcp"
+	}
+	return base + "/api/v1/mcp"
+}
+
+func isPlaceholderOrbitURL(u string) bool {
+	lower := strings.ToLower(strings.TrimSpace(u))
+	return lower == "" ||
+		strings.Contains(lower, "orbit.example.com") ||
+		strings.Contains(lower, "localhost:3000") ||
+		strings.Contains(lower, "127.0.0.1:3000")
+}
+
 // GitConfig stores persisted Git author and branch configuration.
 type GitConfig struct {
 	UserName      string `json:"user_name,omitempty"`
@@ -239,13 +274,20 @@ func NewManager(cfg Config) (*Manager, error) {
 		httpClient:    httpClient,
 	}
 	_ = m.EnsureGitAndSSH()
+	if initCtx, err := m.LoadContext(); err == nil {
+		_ = m.SyncToolMCPConfigs(initCtx)
+	}
 	return m, nil
 }
 
 // SaveContext writes context.json and env.sh under ~/.config/orbit and mirrors context.json into <workDir>/.orbit.
 func (m *Manager) SaveContext(ctxData OrbitContext) error {
 	existing, _ := m.LoadContext()
-	ctxData.OrbitURL = fallbackStr(ctxData.OrbitURL, existing.OrbitURL)
+	if isPlaceholderOrbitURL(ctxData.OrbitURL) && !isPlaceholderOrbitURL(existing.OrbitURL) {
+		ctxData.OrbitURL = existing.OrbitURL
+	} else {
+		ctxData.OrbitURL = fallbackStr(ctxData.OrbitURL, existing.OrbitURL)
+	}
 	ctxData.OrbitMCPToken = fallbackStr(ctxData.OrbitMCPToken, existing.OrbitMCPToken)
 	ctxData.WorkspaceID = fallbackStr(ctxData.WorkspaceID, existing.WorkspaceID)
 	ctxData.WorkspaceSlug = fallbackStr(ctxData.WorkspaceSlug, existing.WorkspaceSlug)
@@ -260,7 +302,12 @@ func (m *Manager) SaveContext(ctxData OrbitContext) error {
 		return err
 	}
 	_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "context.json"), raw, 0o600)
-	return m.writeEnvSh(ctxData)
+	if err := m.writeEnvSh(ctxData); err != nil {
+		return err
+	}
+	_ = m.SyncToolMCPConfigs(ctxData)
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
+	return nil
 }
 
 // LoadContext reads ~/.config/orbit/context.json (falling back to <workDir>/.orbit/context.json) and merges any ORBIT_* environment variables.
@@ -272,7 +319,11 @@ func (m *Manager) LoadContext() (OrbitContext, error) {
 	if wsData, err := os.ReadFile(filepath.Join(m.workDir, ".orbit", "context.json")); err == nil {
 		var wsCtx OrbitContext
 		if json.Unmarshal(wsData, &wsCtx) == nil {
-			out.OrbitURL = fallbackStr(out.OrbitURL, wsCtx.OrbitURL)
+			if isPlaceholderOrbitURL(out.OrbitURL) && !isPlaceholderOrbitURL(wsCtx.OrbitURL) {
+				out.OrbitURL = wsCtx.OrbitURL
+			} else {
+				out.OrbitURL = fallbackStr(out.OrbitURL, wsCtx.OrbitURL)
+			}
 			out.OrbitMCPToken = fallbackStr(out.OrbitMCPToken, wsCtx.OrbitMCPToken)
 			out.WorkspaceID = fallbackStr(out.WorkspaceID, wsCtx.WorkspaceID)
 			out.WorkspaceSlug = fallbackStr(out.WorkspaceSlug, wsCtx.WorkspaceSlug)
@@ -284,7 +335,12 @@ func (m *Manager) LoadContext() (OrbitContext, error) {
 		}
 	}
 
-	out.OrbitURL = fallbackStr(out.OrbitURL, os.Getenv("ORBIT_URL"))
+	envURL := strings.TrimSpace(os.Getenv("ORBIT_URL"))
+	if !isPlaceholderOrbitURL(envURL) && isPlaceholderOrbitURL(out.OrbitURL) {
+		out.OrbitURL = envURL
+	} else {
+		out.OrbitURL = fallbackStr(out.OrbitURL, envURL)
+	}
 	out.OrbitMCPToken = fallbackStr(out.OrbitMCPToken, os.Getenv("ORBIT_MCP_TOKEN"))
 	out.WorkspaceID = fallbackStr(out.WorkspaceID, os.Getenv("ORBIT_MACHINED_WORKSPACE_ID"))
 	out.WorkspaceSlug = fallbackStr(out.WorkspaceSlug, os.Getenv("ORBIT_WORKSPACE_SLUG"))
@@ -991,6 +1047,124 @@ func (m *Manager) AutoloadAllWorkspaceFlakes(ctx context.Context) ([]string, err
 	return enabled, nil
 }
 
+// SyncToolMCPConfigs idempotently writes and updates the Orbit MCP server configuration
+// files for Claude Code, Antigravity CLI, and OpenCode using each tool's native schema,
+// and repairs any stale "orbit" server entries in workspace .mcp.json files.
+func (m *Manager) SyncToolMCPConfigs(orbitCtx Context) error {
+	mcpServerURL := BuildMCPServerURL(orbitCtx.OrbitURL, orbitCtx.WorkspaceSlug)
+	orbitServerSpec := buildHTTPMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
+	agyServerSpec := buildAgyMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
+	openCodeServerSpec := buildOpenCodeMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
+
+	if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".claude.json"), orbitServerSpec, map[string]any{
+		"hasCompletedOnboarding": true,
+	}); err != nil {
+		return err
+	}
+	if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".claude", "settings.json"), orbitServerSpec, nil); err != nil {
+		return err
+	}
+	m.repairWorkspaceMCPJSONFiles(orbitServerSpec)
+
+	for _, p := range []string{
+		filepath.Join(m.homeDir, ".gemini", "config", "mcp_config.json"),
+		filepath.Join(m.homeDir, ".gemini", "settings.json"),
+		filepath.Join(m.homeDir, ".config", "antigravity", "mcp.json"),
+	} {
+		if err := mergeMCPServerIntoJSONFile(p, agyServerSpec, nil); err != nil {
+			return err
+		}
+	}
+
+	for _, p := range []string{
+		filepath.Join(m.homeDir, ".config", "opencode", "opencode.json"),
+		filepath.Join(m.homeDir, ".config", "opencode", "config.json"),
+	} {
+		if err := mergeOpenCodeMCPConfigFile(p, "orbit", openCodeServerSpec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildHTTPMCPServerSpec(mcpServerURL, token string) map[string]any {
+	spec := map[string]any{
+		"type": "http",
+		"url":  mcpServerURL,
+	}
+	if trimmed := strings.TrimSpace(token); trimmed != "" {
+		spec["headers"] = map[string]any{
+			"Authorization": "Bearer " + trimmed,
+		}
+	}
+	return spec
+}
+
+func buildAgyMCPServerSpec(mcpServerURL, token string) map[string]any {
+	spec := map[string]any{
+		"type":      "http",
+		"url":       mcpServerURL,
+		"serverUrl": mcpServerURL,
+		"disabled":  false,
+	}
+	if trimmed := strings.TrimSpace(token); trimmed != "" {
+		spec["headers"] = map[string]any{
+			"Authorization": "Bearer " + trimmed,
+		}
+	}
+	return spec
+}
+
+func buildOpenCodeMCPServerSpec(mcpServerURL, token string) map[string]any {
+	spec := map[string]any{
+		"type":    "remote",
+		"url":     mcpServerURL,
+		"enabled": true,
+	}
+	if trimmed := strings.TrimSpace(token); trimmed != "" {
+		spec["headers"] = map[string]any{
+			"Authorization": "Bearer " + trimmed,
+		}
+	}
+	return spec
+}
+
+func (m *Manager) repairWorkspaceMCPJSONFiles(orbitServerSpec map[string]any) {
+	if strings.TrimSpace(m.workDir) == "" {
+		return
+	}
+	candidates := []string{filepath.Join(m.workDir, ".mcp.json")}
+	if entries, err := os.ReadDir(m.workDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				candidates = append(candidates, filepath.Join(m.workDir, e.Name(), ".mcp.json"))
+			}
+		}
+	}
+	for _, path := range candidates {
+		raw, err := os.ReadFile(path)
+		if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+			continue
+		}
+		mcpServers, ok := doc["mcpServers"].(map[string]any)
+		if !ok || mcpServers == nil {
+			continue
+		}
+		if _, hasOrbit := mcpServers["orbit"]; !hasOrbit {
+			continue
+		}
+		mcpServers["orbit"] = orbitServerSpec
+		doc["mcpServers"] = mcpServers
+		if encoded, err := json.MarshalIndent(doc, "", "  "); err == nil {
+			_ = writeConfigFile(path, append(encoded, '\n'), 0o600)
+		}
+	}
+}
+
 // ConfigureTools configures one or more AI and developer CLI tools ("claude", "agy", "opencode",
 // "codex", "gemini", "cursor", "aider", "gh", "git", or "all") and persists the selections in state.json.
 func (m *Manager) ConfigureTools(selected []string) ([]string, error) {
@@ -1011,15 +1185,13 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 	}
 
 	orbitCtx, _ := m.LoadContext()
-	mcpServerURL := fallbackStr(strings.TrimRight(orbitCtx.OrbitURL, "/"), "http://localhost:3000") + "/mcp"
-
-	orbitServerSpec := map[string]any{
-		"type": "http",
-		"url":  mcpServerURL,
-		"headers": map[string]string{
-			"Authorization": "Bearer " + orbitCtx.OrbitMCPToken,
-		},
+	if err := m.SyncToolMCPConfigs(orbitCtx); err != nil {
+		return nil, err
 	}
+	mcpServerURL := BuildMCPServerURL(orbitCtx.OrbitURL, orbitCtx.WorkspaceSlug)
+	orbitServerSpec := buildHTTPMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
+	agyServerSpec := buildAgyMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
+	openCodeServerSpec := buildOpenCodeMCPServerSpec(mcpServerURL, orbitCtx.OrbitMCPToken)
 
 	st, _ := m.LoadState()
 	var configured []string
@@ -1041,13 +1213,14 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 			if err := mergeMCPServerIntoJSONFile(filepath.Join(m.homeDir, ".claude", "settings.json"), orbitServerSpec, nil); err != nil {
 				return configured, err
 			}
+			m.repairWorkspaceMCPJSONFiles(orbitServerSpec)
 		case "agy":
 			for _, p := range []string{
 				filepath.Join(m.homeDir, ".gemini", "config", "mcp_config.json"),
 				filepath.Join(m.homeDir, ".gemini", "settings.json"),
 				filepath.Join(m.homeDir, ".config", "antigravity", "mcp.json"),
 			} {
-				if err := mergeMCPServerIntoJSONFile(p, orbitServerSpec, nil); err != nil {
+				if err := mergeMCPServerIntoJSONFile(p, agyServerSpec, nil); err != nil {
 					return configured, err
 				}
 			}
@@ -1057,10 +1230,10 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 			}
 		case "opencode":
 			for _, p := range []string{
-				filepath.Join(m.homeDir, ".config", "opencode", "config.json"),
 				filepath.Join(m.homeDir, ".config", "opencode", "opencode.json"),
+				filepath.Join(m.homeDir, ".config", "opencode", "config.json"),
 			} {
-				if err := mergeMCPServerIntoJSONFile(p, orbitServerSpec, nil); err != nil {
+				if err := mergeOpenCodeMCPConfigFile(p, "orbit", openCodeServerSpec); err != nil {
 					return configured, err
 				}
 			}
@@ -1137,6 +1310,60 @@ func mergeMCPServerIntoJSONFile(path string, orbitServerSpec map[string]any, def
 	}
 	mcpServers["orbit"] = orbitServerSpec
 	doc["mcpServers"] = mcpServers
+
+	if projects, ok := doc["projects"].(map[string]any); ok && projects != nil {
+		for projKey, rawProj := range projects {
+			projMap, ok := rawProj.(map[string]any)
+			if !ok || projMap == nil {
+				continue
+			}
+			projServers, ok := projMap["mcpServers"].(map[string]any)
+			if !ok || projServers == nil {
+				continue
+			}
+			if _, hasOrbit := projServers["orbit"]; hasOrbit {
+				projServers["orbit"] = orbitServerSpec
+				projMap["mcpServers"] = projServers
+				projects[projKey] = projMap
+			}
+		}
+		doc["projects"] = projects
+	}
+
+	encoded, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeConfigFile(path, append(encoded, '\n'), 0o600)
+}
+
+func mergeOpenCodeMCPConfigFile(path string, serverName string, serverSpec map[string]any) error {
+	doc := make(map[string]any)
+	if existing, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(existing)) > 0 {
+		if err := json.Unmarshal(existing, &doc); err != nil {
+			return nil
+		}
+	}
+	if _, hasSchema := doc["$schema"]; !hasSchema {
+		doc["$schema"] = "https://opencode.ai/config.json"
+	}
+	mcpMap, ok := doc["mcp"].(map[string]any)
+	if !ok || mcpMap == nil {
+		mcpMap = make(map[string]any)
+	}
+	if legacyServers, hasLegacy := doc["mcpServers"].(map[string]any); hasLegacy {
+		for k, v := range legacyServers {
+			if k == serverName {
+				continue
+			}
+			if _, exists := mcpMap[k]; !exists {
+				mcpMap[k] = v
+			}
+		}
+	}
+	delete(doc, "mcpServers")
+	mcpMap[serverName] = serverSpec
+	doc["mcp"] = mcpMap
 
 	encoded, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

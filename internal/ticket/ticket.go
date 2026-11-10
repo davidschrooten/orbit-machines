@@ -42,6 +42,8 @@ type Claims struct {
 	WorkspaceSlug string              `json:"ws_slug"`
 	UserLogin     string              `json:"user_login"`
 	Tier          domain.ResourceTier `json:"tier"`
+	OrbitURL      string              `json:"orbit_url,omitempty"`
+	MCPToken      string              `json:"mcp_token,omitempty"`
 	IssuedAt      int64               `json:"iat"`
 	ExpiresAt     int64               `json:"exp"`
 }

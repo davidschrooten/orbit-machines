@@ -59,6 +59,19 @@ func TestCodec_SignAndVerify_GoldenVector(t *testing.T) {
 	if mid.PodName() != "machine-ws-99-usr-42" {
 		t.Errorf("PodName() = %q, want machine-ws-99-usr-42", mid.PodName())
 	}
+
+	// Verify optional OrbitURL and MCPToken claims round-trip cleanly.
+	withMCP := claims
+	withMCP.OrbitURL = "https://orbit.acme.dev"
+	withMCP.MCPToken = "omcp_ticket_tok_123"
+	tokMCP, err := codec.Sign(withMCP)
+	if err != nil {
+		t.Fatalf("Sign(withMCP) error: %v", err)
+	}
+	gotMCP, err := codec.Verify(tokMCP, now)
+	if err != nil || gotMCP != withMCP {
+		t.Fatalf("Verify(withMCP) = (%+v, %v), want %+v", gotMCP, err, withMCP)
+	}
 }
 
 func TestNewCodec_Validation(t *testing.T) {

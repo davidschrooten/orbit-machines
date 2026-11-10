@@ -591,3 +591,92 @@ func TestServer_MultiTabConcurrencyAndShutdownVariants(t *testing.T) {
 		t.Fatalf("expected 401 for invalid ticket on DELETE /ws/terminal, got %d", badShutResp.StatusCode)
 	}
 }
+
+func TestServer_TicketOrbitURLAndMCPTokenFallback(t *testing.T) {
+	t.Parallel()
+
+	frameCodec, err := protocol.NewFrameCodec()
+	if err != nil {
+		t.Fatalf("NewFrameCodec: %v", err)
+	}
+
+	var pushedContext map[string]any
+	podSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/context" {
+			_ = json.NewDecoder(r.Body).Decode(&pushedContext)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		snap, _ := frameCodec.EncodeSnapshot([]byte("ready"))
+		_ = conn.Write(r.Context(), websocket.MessageBinary, snap)
+	}))
+	defer podSrv.Close()
+
+	podWSURL := "ws" + strings.TrimPrefix(podSrv.URL, "http") + "/ws"
+	fakeK8s := k8s.NewFakePodOrchestrator(10)
+	fakeK8s.SetDefaultWebSocketURL(podWSURL)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	ticketCodec, _ := ticket.NewCodecFromClusterToken(testClusterToken)
+
+	// Server configured with placeholder OrbitURL and nil OrbitClient
+	srv, err := dispatcher.NewServer(dispatcher.ServerConfig{
+		OrbitURL:     "https://orbit.example.com",
+		ClusterToken: testClusterToken,
+		TicketCodec:  ticketCodec,
+		FrameCodec:   frameCodec,
+		Orchestrator: fakeK8s,
+		Now:          func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	gwSrv := httptest.NewServer(srv.Handler())
+	defer gwSrv.Close()
+
+	signedTicket, err := ticketCodec.Sign(ticket.Claims{
+		JTI:           "jti_claims_mcp",
+		Issuer:        ticket.ExpectedIssuer,
+		Subject:       "usr_claims",
+		WorkspaceID:   "ws_claims",
+		WorkspaceSlug: "acme",
+		UserLogin:     "alice",
+		Tier:          domain.TierStandard,
+		OrbitURL:      "https://orbit.from-ticket.dev/",
+		MCPToken:      "omcp_from_ticket_123",
+		IssuedAt:      now.Unix(),
+		ExpiresAt:     now.Add(60 * time.Second).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(gwSrv.URL, "http") + "/ws/terminal?ticket=" + signedTicket
+	conn, _, err := websocket.Dial(ctx, wsURL, nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	for {
+		_, raw, rErr := conn.Read(ctx)
+		if rErr != nil {
+			break
+		}
+		if dec, dErr := frameCodec.Decode(raw); dErr == nil && dec.Type == protocol.FrameSnapshot {
+			break
+		}
+	}
+
+	if pushedContext["orbit_url"] != "https://orbit.from-ticket.dev" || pushedContext["orbit_mcp_token"] != "omcp_from_ticket_123" {
+		t.Fatalf("unexpected pushedContext: %+v", pushedContext)
+	}
+}

@@ -170,9 +170,8 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 				initCtx.WorkspaceID = cfg.MachineID.WorkspaceID()
 				initCtx.UserID = cfg.MachineID.UserID()
 				_ = mgr.SaveContext(initCtx)
-				if initCtx.OrbitMCPToken != "" {
-					_, _ = mgr.ConfigureTools(helper.SupportedTools)
-				}
+				_ = mgr.SyncToolMCPConfigs(initCtx)
+				_, _ = mgr.ConfigureTools(helper.SupportedTools)
 			}
 			_ = mgr.EnsureGitAndSSH()
 			if cfgNixBytes, readErr := os.ReadFile(mgr.ConfigurationNixPath()); readErr == nil &&
@@ -273,9 +272,9 @@ func applyContextUpdate(mgr *helper.Manager, req tui.ContextUpdateRequest) error
 	}); err != nil {
 		return err
 	}
-	if req.OrbitMCPToken != "" {
-		_, _ = mgr.ConfigureTools(helper.SupportedTools)
-	}
+	merged, _ := mgr.LoadContext()
+	_ = mgr.SyncToolMCPConfigs(merged)
+	_, _ = mgr.ConfigureTools(helper.SupportedTools)
 	_ = mgr.EnsureGitAndSSH()
 	return nil
 }
