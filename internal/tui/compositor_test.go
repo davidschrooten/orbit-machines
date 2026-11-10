@@ -386,6 +386,7 @@ func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 	)
 
 	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+		WorkspaceDir: t.TempDir(),
 		ShellSpawner: func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -471,13 +472,20 @@ func TestWSServer_MultiTabShellSpawnerContextAndSnapshot(t *testing.T) {
 	pingBytes, _ := codec.EncodePing(42)
 	_ = conn1.Write(ctx, websocket.MessageBinary, pingBytes)
 
-	_, rawPong, err := conn1.Read(ctx)
-	if err != nil {
-		t.Fatalf("Read Pong: %v", err)
+	var gotPong bool
+	for range 6 {
+		_, rawFrame, readErr := conn1.Read(ctx)
+		if readErr != nil {
+			t.Fatalf("Read frame waiting for Pong: %v", readErr)
+		}
+		frame, _ := codec.Decode(rawFrame)
+		if frame.Type == protocol.FramePong && frame.TimestampMS == 42 {
+			gotPong = true
+			break
+		}
 	}
-	pongFrame, _ := codec.Decode(rawPong)
-	if pongFrame.Type != protocol.FramePong || pongFrame.TimestampMS != 42 {
-		t.Fatalf("unexpected Pong frame: %+v", pongFrame)
+	if !gotPong {
+		t.Fatalf("did not receive Pong frame (42)")
 	}
 
 	// Feed new output to tab-1 pane -> verify 0x11 FrameDiff arrives immediately on conn1.
@@ -587,6 +595,7 @@ func TestWSServer_FileUploadAndKeepalive(t *testing.T) {
 
 	uploadDir := filepath.Join(t.TempDir(), "workspace")
 	wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
+		WorkspaceDir: t.TempDir(),
 		ShellSpawner: func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 			p := pty.NewVirtualPane(tabID, "Shell "+tabID, cols, rows)
 			p.FeedOutput([]byte("$ "))
@@ -747,5 +756,150 @@ func TestWSServer_FileUploadAndKeepalive(t *testing.T) {
 	_ = mpFailResp.Body.Close()
 	if mpFailResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 on multipart when workspaceDir is a regular file, got %d", mpFailResp.StatusCode)
+	}
+}
+
+func TestWSServer_CrossDeviceAndReloadPersistentTabSessions(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := filepath.Join(t.TempDir(), "workspace")
+	spawner := func(_ context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
+		p := pty.NewVirtualPane(tabID, "Shell "+tabID, cols, rows)
+		p.FeedOutput([]byte("prompt:" + tabID + "$ "))
+		return p, nil
+	}
+
+	wsSrv1, err := tui.NewWSServer(tui.WSServerConfig{
+		WorkspaceDir: workspaceDir,
+		ShellSpawner: spawner,
+	})
+	if err != nil {
+		t.Fatalf("NewWSServer(1): %v", err)
+	}
+	httpSrv1 := httptest.NewServer(wsSrv1.Handler())
+	defer httpSrv1.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	codec, _ := protocol.NewFrameCodec()
+	wsBase1 := "ws" + strings.TrimPrefix(httpSrv1.URL, "http") + "/ws"
+
+	// 1. Device A connects to tab-1 and tab-2, and produces output in both tabs.
+	connA1, _, err := websocket.Dial(ctx, wsBase1+"?tab=tab-1", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial A1: %v", err)
+	}
+	defer func() { _ = connA1.CloseNow() }()
+
+	// Drain initial snapshot and session_state metadata on connA1.
+	_, rawSnapA1, _ := connA1.Read(ctx)
+	snapA1, _ := codec.Decode(rawSnapA1)
+	if snapA1.Type != protocol.FrameSnapshot {
+		t.Fatalf("expected FrameSnapshot on connA1, got 0x%02x", snapA1.Type)
+	}
+	_, rawMetaA1, _ := connA1.Read(ctx)
+	metaA1, _ := codec.Decode(rawMetaA1)
+	if metaA1.Type != protocol.FrameMetadata || metaA1.Metadata == nil || len(metaA1.Metadata.ActiveTabs) != 1 || metaA1.Metadata.ActiveTabs[0] != "tab-1" {
+		t.Fatalf("unexpected initial metadata on connA1: %+v", metaA1.Metadata)
+	}
+
+	// Device A opens tab-2 and tab-10 (verify numeric tab sorting: tab-1, tab-2, tab-10).
+	connA2, _, err := websocket.Dial(ctx, wsBase1+"?tab=tab-2", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial A2: %v", err)
+	}
+	defer func() { _ = connA2.CloseNow() }()
+	_, _, _ = connA2.Read(ctx) // snapshot
+	_, rawMetaA2, _ := connA2.Read(ctx)
+	metaA2, _ := codec.Decode(rawMetaA2)
+	if metaA2.Metadata == nil || strings.Join(metaA2.Metadata.ActiveTabs, ",") != "tab-1,tab-2" {
+		t.Fatalf("expected active_tabs=[tab-1,tab-2], got %+v", metaA2.Metadata)
+	}
+
+	connA10, _, err := websocket.Dial(ctx, wsBase1+"?tab=tab-10", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial A10: %v", err)
+	}
+	defer func() { _ = connA10.CloseNow() }()
+	_, _, _ = connA10.Read(ctx) // snapshot
+	_, _, _ = connA10.Read(ctx) // metadata
+
+	// Verify GET /api/v1/tabs returns sorted active_tabs: ["tab-1", "tab-2", "tab-10"].
+	tabsResp, err := http.Get(httpSrv1.URL + "/api/v1/tabs")
+	if err != nil {
+		t.Fatalf("GET /api/v1/tabs: %v", err)
+	}
+	var tabsPayload struct {
+		ActiveTabs []string `json:"active_tabs"`
+	}
+	_ = json.NewDecoder(tabsResp.Body).Decode(&tabsPayload)
+	_ = tabsResp.Body.Close()
+	if got := strings.Join(tabsPayload.ActiveTabs, ","); got != "tab-1,tab-2,tab-10" {
+		t.Fatalf("GET /api/v1/tabs active_tabs = %q, want tab-1,tab-2,tab-10", got)
+	}
+
+	// 2. Device B connects to default /ws?tab=tab-1 -> immediately receives active_tabs=["tab-1","tab-2","tab-10"].
+	connB1, _, err := websocket.Dial(ctx, wsBase1+"?tab=tab-1", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial B1: %v", err)
+	}
+	defer func() { _ = connB1.CloseNow() }()
+	_, _, _ = connB1.Read(ctx) // snapshot
+	_, rawMetaB1, _ := connB1.Read(ctx)
+	metaB1, _ := codec.Decode(rawMetaB1)
+	if metaB1.Metadata == nil || strings.Join(metaB1.Metadata.ActiveTabs, ",") != "tab-1,tab-2,tab-10" {
+		t.Fatalf("Device B expected active_tabs=[tab-1,tab-2,tab-10], got %+v", metaB1.Metadata)
+	}
+
+	// 3. Closing tab-10 broadcasts ClosedTabID="tab-10" and ActiveTabs=["tab-1","tab-2"] to connected clients.
+	wsSrv1.CloseTab("tab-10")
+	var gotCloseBroadcast bool
+	for range 5 {
+		_, rawEvt, readErr := connB1.Read(ctx)
+		if readErr != nil {
+			t.Fatalf("connB1.Read after CloseTab: %v", readErr)
+		}
+		evtFrame, _ := codec.Decode(rawEvt)
+		if evtFrame.Type == protocol.FrameMetadata && evtFrame.Metadata != nil && evtFrame.Metadata.ClosedTabID == "tab-10" {
+			if got := strings.Join(evtFrame.Metadata.ActiveTabs, ","); got != "tab-1,tab-2" {
+				t.Fatalf("ActiveTabs after closing tab-10 = %q, want tab-1,tab-2", got)
+			}
+			gotCloseBroadcast = true
+			break
+		}
+	}
+	if !gotCloseBroadcast {
+		t.Fatalf("expected ClosedTabID=tab-10 broadcast on connB1")
+	}
+
+	// 4. Gracefully close wsSrv1 and start a new WSServer (wsSrv2) on the same workspaceDir PVC.
+	_ = wsSrv1.Close()
+
+	wsSrv2, err := tui.NewWSServer(tui.WSServerConfig{
+		WorkspaceDir: workspaceDir,
+		ShellSpawner: spawner,
+	})
+	if err != nil {
+		t.Fatalf("NewWSServer(2): %v", err)
+	}
+	defer func() { _ = wsSrv2.Close() }()
+	if got := strings.Join(wsSrv2.ActiveTabIDs(), ","); got != "tab-1,tab-2" {
+		t.Fatalf("wsSrv2.ActiveTabIDs() after restart = %q, want tab-1,tab-2", got)
+	}
+
+	httpSrv2 := httptest.NewServer(wsSrv2.Handler())
+	defer httpSrv2.Close()
+	wsBase2 := "ws" + strings.TrimPrefix(httpSrv2.URL, "http") + "/ws"
+
+	connRestart2, _, err := websocket.Dial(ctx, wsBase2+"?tab=tab-2", nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("Dial tab-2 after restart: %v", err)
+	}
+	defer func() { _ = connRestart2.CloseNow() }()
+	_, rawRestartSnap, _ := connRestart2.Read(ctx)
+	restartSnap, _ := codec.Decode(rawRestartSnap)
+	if !strings.Contains(string(restartSnap.Data), "prompt:tab-2$") {
+		t.Fatalf("expected restored scrollback for tab-2 after restart, got %q", string(restartSnap.Data))
 	}
 }

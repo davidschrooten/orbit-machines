@@ -15,7 +15,7 @@ dispatcher:
   replicaCount: 1
   image:
     repository: ghcr.io/davidschrooten/orbit-dispatcher
-    tag: "0.1.0"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   service:
     type: ClusterIP
@@ -44,7 +44,7 @@ dispatcher:
 machined:
   image:
     repository: ghcr.io/davidschrooten/orbit-machined
-    tag: "0.1.0"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   defaultCPU: "2"
   defaultMemory: "4Gi"

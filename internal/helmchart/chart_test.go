@@ -22,8 +22,8 @@ func TestValidateProductionChart(t *testing.T) {
 	if report.Metadata.Name != "orbit-machines" {
 		t.Fatalf("Metadata.Name = %q, want orbit-machines", report.Metadata.Name)
 	}
-	if report.Metadata.Version != "0.1.0" {
-		t.Fatalf("Metadata.Version = %q, want 0.1.0", report.Metadata.Version)
+	if report.Metadata.Version != "0.2.0" {
+		t.Fatalf("Metadata.Version = %q, want 0.2.0", report.Metadata.Version)
 	}
 
 	if err := ValidateChart(productionChartDir); err != nil {

@@ -20,7 +20,7 @@ import (
 
 // MaxScrollbackBytes is the maximum number of raw output bytes retained per Pane
 // for instant tab snapshot replay upon WebSocket reconnect.
-const MaxScrollbackBytes = 64 * 1024
+const MaxScrollbackBytes = 256 * 1024
 
 // PaneConfig configures a child PTY process and its virtual terminal buffer.
 type PaneConfig struct {
@@ -196,6 +196,26 @@ func (p *Pane) Scrollback() []byte {
 	out := make([]byte, len(p.scrollback))
 	copy(out, p.scrollback)
 	return out
+}
+
+// PrependScrollback seeds prior persisted scrollback bytes in front of any
+// newly produced output (capped at MaxScrollbackBytes).
+func (p *Pane) PrependScrollback(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if bytes.HasPrefix(p.scrollback, data) {
+		return
+	}
+	combined := make([]byte, 0, len(data)+len(p.scrollback))
+	combined = append(combined, data...)
+	combined = append(combined, p.scrollback...)
+	if len(combined) > MaxScrollbackBytes {
+		combined = combined[len(combined)-MaxScrollbackBytes:]
+	}
+	p.scrollback = combined
 }
 
 func (p *Pane) appendScrollbackLocked(chunk []byte) {

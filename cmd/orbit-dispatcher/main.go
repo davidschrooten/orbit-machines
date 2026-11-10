@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the semantic version of orbit-dispatcher.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // ServeRunner executes the dispatcher gateway with a validated configuration.
 type ServeRunner func(ctx context.Context, cfg config.DispatcherConfig) error
