@@ -207,3 +207,101 @@ func TestEnsureInitialized_WritesStarshipJetpackDirenvAndWelcomeBashrc(t *testin
 		t.Fatalf("expected pre-existing .local/bin/agy to be migrated to workspace .orbit/local/bin/agy: %v", err)
 	}
 }
+
+func TestPersistentHomeAcrossPodRestarts_ClaudeAntigravityAndOpenCode(t *testing.T) {
+	t.Parallel()
+
+	// Persistent workspace PVC shared across Pod restarts
+	workDir := filepath.Join(t.TempDir(), "workspace-pvc")
+
+	// Pod 1 starts with ephemeral homeDir1
+	homeDir1 := filepath.Join(t.TempDir(), "pod1-home")
+	if err := shellinit.EnsureInitialized(homeDir1, workDir); err != nil {
+		t.Fatalf("Pod 1 EnsureInitialized: %v", err)
+	}
+
+	// Verify ~/.claude.json and ~/.bash_history are pre-seeded on PVC and symlinked so realpath() resolves
+	resolvedClaudeJSON, err := filepath.EvalSymlinks(filepath.Join(homeDir1, ".claude.json"))
+	if err != nil || resolvedClaudeJSON != filepath.Join(workDir, ".orbit", "home", ".claude.json") {
+		t.Fatalf("expected ~/.claude.json symlink target to resolve to PVC, got (%q, %v)", resolvedClaudeJSON, err)
+	}
+
+	// 1. Simulate Claude Code login and repository conversation history in Pod 1
+	if err := os.MkdirAll(filepath.Join(homeDir1, ".claude", "projects", "-home-orbit-workspace-my-repo"), 0o700); err != nil {
+		t.Fatalf("MkdirAll .claude/projects: %v", err)
+	}
+	claudeCreds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-secret","refreshToken":"sk-ant-ort01-secret"}}`
+	if err := os.WriteFile(filepath.Join(homeDir1, ".claude", ".credentials.json"), []byte(claudeCreds), 0o600); err != nil {
+		t.Fatalf("WriteFile .credentials.json: %v", err)
+	}
+	claudeSession := "{\"type\":\"user\",\"message\":\"Fix auth bug\"}\n{\"type\":\"assistant\",\"message\":\"Done\"}\n"
+	if err := os.WriteFile(filepath.Join(homeDir1, ".claude", "projects", "-home-orbit-workspace-my-repo", "session-1.jsonl"), []byte(claudeSession), 0o600); err != nil {
+		t.Fatalf("WriteFile session-1.jsonl: %v", err)
+	}
+	// Simulate Claude Code atomic write: write .claude.json.tmp in homeDir1 and os.Rename over .claude.json (replacing the symlink!)
+	claudeStateJSON := `{"oauthAccount":{"accountUuid":"acc_123","emailAddress":"dev@acme.dev"},"hasCompletedOnboarding":true,"projects":{"/home/orbit/workspace/my-repo":{"hasTrustDialogAccepted":true,"lastSessionId":"session-1"}}}`
+	tmpClaudePath := filepath.Join(homeDir1, ".claude.json.tmp.999")
+	if err := os.WriteFile(tmpClaudePath, []byte(claudeStateJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile .claude.json.tmp: %v", err)
+	}
+	if err := os.Rename(tmpClaudePath, filepath.Join(homeDir1, ".claude.json")); err != nil {
+		t.Fatalf("Rename .claude.json: %v", err)
+	}
+
+	// 2. Simulate Antigravity CLI (agy) login, custom settings, and conversation history in Pod 1
+	for _, sub := range []string{
+		filepath.Join(homeDir1, ".gemini", "antigravity-cli", "conversations"),
+		filepath.Join(homeDir1, ".gemini", "antigravity-cli", "brain", "conv-1"),
+	} {
+		if err := os.MkdirAll(sub, 0o700); err != nil {
+			t.Fatalf("MkdirAll %s: %v", sub, err)
+		}
+	}
+	agyToken := `{"access_token":"ya29.agy-oauth-token","refresh_token":"1//agy-refresh"}`
+	agySettings := `{"model":"gemini-2.5-pro","autoApproveSafeCommands":true}`
+	agyConvPB := "PROTO_CONVERSATION_STATE_1"
+	agyTranscript := "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"Build feature\"}\n"
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "antigravity-oauth-token"), []byte(agyToken), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "settings.json"), []byte(agySettings), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "conversations", "conv-1.pb"), []byte(agyConvPB), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".gemini", "antigravity-cli", "brain", "conv-1", "transcript.jsonl"), []byte(agyTranscript), 0o600)
+
+	// 3. Simulate OpenCode login & conversation history in ~/.local/share/opencode
+	_ = os.MkdirAll(filepath.Join(homeDir1, ".local", "share", "opencode", "project", "my-repo"), 0o700)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".local", "share", "opencode", "auth.json"), []byte(`{"anthropic":{"key":"sk-ant-opencode"}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(homeDir1, ".local", "share", "opencode", "project", "my-repo", "session.json"), []byte(`{"id":"oc-sess-1"}`), 0o600)
+
+	// SyncPersistentHomeFiles moves the atomically replaced .claude.json back to PVC and re-links it
+	shellinit.SyncPersistentHomeFiles(homeDir1, workDir)
+
+	// Destroy Pod 1 ephemeral homeDir1 completely!
+	if err := os.RemoveAll(homeDir1); err != nil {
+		t.Fatalf("RemoveAll(homeDir1): %v", err)
+	}
+
+	// Pod 2 boots with a brand new empty ephemeral homeDir2 and the same persistent workDir
+	homeDir2 := filepath.Join(t.TempDir(), "pod2-home")
+	if err := shellinit.EnsureInitialized(homeDir2, workDir); err != nil {
+		t.Fatalf("Pod 2 EnsureInitialized: %v", err)
+	}
+
+	for relPath, want := range map[string]string{
+		".claude/.credentials.json":                                         claudeCreds,
+		".claude/projects/-home-orbit-workspace-my-repo/session-1.jsonl":    claudeSession,
+		".claude.json":                                                      claudeStateJSON,
+		".gemini/antigravity-cli/antigravity-oauth-token":                   agyToken,
+		".gemini/antigravity-cli/settings.json":                             agySettings,
+		".gemini/antigravity-cli/conversations/conv-1.pb":                   agyConvPB,
+		".gemini/antigravity-cli/brain/conv-1/transcript.jsonl":             agyTranscript,
+		".local/share/opencode/auth.json":                                   `{"anthropic":{"key":"sk-ant-opencode"}}`,
+		".local/share/opencode/project/my-repo/session.json":                `{"id":"oc-sess-1"}`,
+	} {
+		gotBytes, err := os.ReadFile(filepath.Join(homeDir2, relPath))
+		if err != nil {
+			t.Fatalf("Pod 2 ReadFile(%s): %v", relPath, err)
+		}
+		if string(gotBytes) != want {
+			t.Errorf("Pod 2 %s = %q, want %q", relPath, string(gotBytes), want)
+		}
+	}
+}

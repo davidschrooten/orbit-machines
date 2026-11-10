@@ -4,6 +4,7 @@
 package shellinit
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -413,9 +414,10 @@ func EnsureConfig(homeDir string) error {
 }
 
 // EnsureInitialized creates standard Orbit Machine configuration directories,
-// writes ~/.config/starship.toml (upgrading to the Jetpack preset if needed) and
-// ~/.config/direnv/direnv.toml if missing, and ensures ~/.bashrc and ~/.bash_profile
-// hook direnv, starship, env.sh, and the interactive welcome banner.
+// links AI tool state and user dotfiles in homeDir to <workDir>/.orbit/home on the
+// persistent workspace PVC, writes ~/.config/starship.toml and ~/.config/direnv/direnv.toml
+// if missing, and ensures ~/.bashrc and ~/.bash_profile hook direnv, starship, env.sh,
+// and the interactive welcome banner.
 func EnsureInitialized(homeDir, workDir string) error {
 	homeDir = strings.TrimSpace(homeDir)
 	workDir = strings.TrimSpace(workDir)
@@ -425,6 +427,17 @@ func EnsureInitialized(homeDir, workDir string) error {
 	if workDir == "" {
 		return fmt.Errorf("%w: workDir is required", domain.ErrInvalidConfig)
 	}
+
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		return fmt.Errorf("creating directory %s: %w", homeDir, err)
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return fmt.Errorf("creating directory %s: %w", workDir, err)
+	}
+
+	ensurePersistentLocalDir(homeDir, workDir)
+	ensurePersistentHome(homeDir, workDir)
+	SyncPersistentHomeFiles(homeDir, workDir)
 
 	dirs := []string{
 		filepath.Join(homeDir, ".config"),
@@ -458,8 +471,6 @@ func EnsureInitialized(homeDir, workDir string) error {
 			}
 		}
 	}
-
-	ensurePersistentLocalDir(homeDir, workDir)
 
 	nixProfileLink := filepath.Join(homeDir, ".nix-profile")
 	if _, err := os.Lstat(nixProfileLink); os.IsNotExist(err) {
@@ -503,7 +514,340 @@ func EnsureInitialized(homeDir, workDir string) error {
 		}
 	}
 
+	SyncPersistentHomeFiles(homeDir, workDir)
 	return nil
+}
+
+type persistentDirSpec struct {
+	name string
+	perm os.FileMode
+}
+
+var persistentHomeDirs = []persistentDirSpec{
+	{name: ".config", perm: 0o755},
+	{name: ".claude", perm: 0o700},
+	{name: ".gemini", perm: 0o700},
+	{name: ".antigravity", perm: 0o700},
+	{name: ".antigravity-cli", perm: 0o700},
+	{name: ".opencode", perm: 0o700},
+	{name: ".codex", perm: 0o700},
+	{name: ".cursor", perm: 0o700},
+	{name: ".aider", perm: 0o700},
+	{name: ".ssh", perm: 0o700},
+	{name: ".cache", perm: 0o755},
+	{name: ".npm", perm: 0o755},
+	{name: ".pki", perm: 0o700},
+	{name: ".gnupg", perm: 0o700},
+}
+
+var persistentHomeFiles = []string{
+	".claude.json",
+	".claude.json.backup",
+	".gitconfig",
+	".git-credentials",
+	".aider.conf.yml",
+	".bash_history",
+	".npmrc",
+	".bashrc",
+	".bash_profile",
+	".profile",
+}
+
+func isKnownHomeFile(name string) bool {
+	for _, f := range persistentHomeFiles {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldIgnoreHomeEntry(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return true
+	}
+	switch name {
+	case "workspace", ".orbit", ".nix-profile", ".nix-defexpr", ".local":
+		return true
+	}
+	if strings.Contains(name, ".tmp") || strings.HasSuffix(name, ".lock") || strings.HasSuffix(name, ".orbit-sync-tmp") {
+		return true
+	}
+	return false
+}
+
+func canLinkHomePath(homeDir, workDir, homePath string) bool {
+	cleanHome := filepath.Clean(strings.TrimSpace(homeDir))
+	cleanWork := filepath.Clean(strings.TrimSpace(workDir))
+	cleanHomePath := filepath.Clean(strings.TrimSpace(homePath))
+	if cleanHome == "" || cleanWork == "" || cleanHome == cleanWork {
+		return false
+	}
+	if cleanWork == cleanHomePath || strings.HasPrefix(cleanWork, cleanHomePath+string(os.PathSeparator)) {
+		return false
+	}
+	return true
+}
+
+func ensurePersistentHome(homeDir, workDir string) {
+	cleanHome := filepath.Clean(strings.TrimSpace(homeDir))
+	cleanWork := filepath.Clean(strings.TrimSpace(workDir))
+	if cleanHome == "" || cleanWork == "" || cleanHome == cleanWork {
+		return
+	}
+	pvcHome := filepath.Join(workDir, ".orbit", "home")
+	_ = os.MkdirAll(pvcHome, 0o755)
+
+	// Seed <workDir>/.orbit/home/.ssh from legacy <workDir>/.orbit/ssh if present.
+	legacySSHKey := filepath.Join(workDir, ".orbit", "ssh", "id_ed25519")
+	pvcSSHDir := filepath.Join(pvcHome, ".ssh")
+	pvcSSHKey := filepath.Join(pvcSSHDir, "id_ed25519")
+	if _, err := os.Stat(legacySSHKey); err == nil {
+		if _, dstErr := os.Stat(pvcSSHKey); os.IsNotExist(dstErr) {
+			_ = os.MkdirAll(pvcSSHDir, 0o700)
+			_ = os.Chmod(pvcSSHDir, 0o700)
+			if privData, rErr := os.ReadFile(legacySSHKey); rErr == nil {
+				_ = os.WriteFile(pvcSSHKey, privData, 0o600)
+			}
+			if pubData, rErr := os.ReadFile(legacySSHKey + ".pub"); rErr == nil {
+				_ = os.WriteFile(pvcSSHKey+".pub", pubData, 0o644)
+			}
+		}
+	}
+
+	for _, spec := range persistentHomeDirs {
+		homePath := filepath.Join(homeDir, spec.name)
+		targetPath := filepath.Join(pvcHome, spec.name)
+		if !canLinkHomePath(homeDir, workDir, homePath) {
+			continue
+		}
+		ensurePersistentDirLink(homePath, targetPath, spec.perm)
+	}
+
+	// Link any additional directories or files already persisted in <workDir>/.orbit/home from prior sessions.
+	if entries, err := os.ReadDir(pvcHome); err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if shouldIgnoreHomeEntry(name) {
+				continue
+			}
+			homePath := filepath.Join(homeDir, name)
+			targetPath := filepath.Join(pvcHome, name)
+			if !canLinkHomePath(homeDir, workDir, homePath) {
+				continue
+			}
+			if entry.IsDir() && !isKnownHomeFile(name) {
+				ensurePersistentDirLink(homePath, targetPath, 0o700)
+			} else if !entry.IsDir() {
+				if _, lerr := os.Lstat(homePath); os.IsNotExist(lerr) {
+					_ = os.Symlink(targetPath, homePath)
+				}
+			}
+		}
+	}
+}
+
+func ensurePersistentDirLink(homePath, targetPath string, perm os.FileMode) {
+	if perm == 0 {
+		perm = 0o700
+	}
+	_ = os.MkdirAll(targetPath, perm)
+	if perm == 0o700 {
+		_ = os.Chmod(targetPath, 0o700)
+	}
+
+	fi, err := os.Lstat(homePath)
+	if os.IsNotExist(err) {
+		_ = os.Symlink(targetPath, homePath)
+		return
+	}
+	if err != nil {
+		return
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		dest, lerr := os.Readlink(homePath)
+		if lerr != nil || filepath.Clean(dest) != filepath.Clean(targetPath) {
+			_ = os.Remove(homePath)
+			_ = os.Symlink(targetPath, homePath)
+		}
+		return
+	}
+	if fi.IsDir() {
+		mergeDirWithoutOverwrite(homePath, targetPath)
+		_ = os.RemoveAll(homePath)
+		_ = os.Symlink(targetPath, homePath)
+	}
+}
+
+func mergeDirWithoutOverwrite(srcDir, dstDir string) {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(srcDir, entry.Name())
+		dstPath := filepath.Join(dstDir, entry.Name())
+		info, lerr := os.Lstat(srcPath)
+		if lerr != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if _, dstErr := os.Lstat(dstPath); os.IsNotExist(dstErr) {
+				if linkTarget, rerr := os.Readlink(srcPath); rerr == nil {
+					_ = os.Symlink(linkTarget, dstPath)
+				}
+			}
+			continue
+		}
+		if info.IsDir() {
+			perm := info.Mode().Perm()
+			if perm == 0 {
+				perm = 0o755
+			}
+			_ = os.MkdirAll(dstPath, perm)
+			mergeDirWithoutOverwrite(srcPath, dstPath)
+			continue
+		}
+		if info.Mode().IsRegular() {
+			if _, dstErr := os.Lstat(dstPath); os.IsNotExist(dstErr) {
+				if data, rerr := os.ReadFile(srcPath); rerr == nil {
+					perm := info.Mode().Perm()
+					if perm == 0 {
+						perm = 0o600
+					}
+					_ = os.WriteFile(dstPath, data, perm)
+				}
+			}
+		}
+	}
+}
+
+// SyncPersistentHomeFiles ensures top-level dotfiles and dot-directories in homeDir
+// (such as ~/.claude.json, ~/.gitconfig, ~/.bash_history, ~/.aider.conf.yml, and any
+// atomically renamed config files) are synced to <workDir>/.orbit/home and linked back into homeDir.
+func SyncPersistentHomeFiles(homeDir, workDir string) {
+	homeDir = strings.TrimSpace(homeDir)
+	workDir = strings.TrimSpace(workDir)
+	if homeDir == "" || workDir == "" {
+		return
+	}
+	if filepath.Clean(homeDir) == filepath.Clean(workDir) {
+		return
+	}
+	if hInfo, err := os.Stat(homeDir); err != nil || !hInfo.IsDir() {
+		return
+	}
+
+	pvcHome := filepath.Join(workDir, ".orbit", "home")
+	if err := os.MkdirAll(pvcHome, 0o755); err != nil {
+		return
+	}
+
+	// Pre-seed .claude.json and .bash_history in pvcHome when neither pvcHome nor homeDir has them yet,
+	// so realpath() on their symlinks always resolves to an existing regular file on disk.
+	pvcClaudeJSON := filepath.Join(pvcHome, ".claude.json")
+	homeClaudeJSON := filepath.Join(homeDir, ".claude.json")
+	if _, err := os.Stat(pvcClaudeJSON); os.IsNotExist(err) {
+		if _, hErr := os.Lstat(homeClaudeJSON); os.IsNotExist(hErr) {
+			_ = os.WriteFile(pvcClaudeJSON, []byte("{\"hasCompletedOnboarding\": true}\n"), 0o600)
+		}
+	}
+	pvcBashHistory := filepath.Join(pvcHome, ".bash_history")
+	homeBashHistory := filepath.Join(homeDir, ".bash_history")
+	if _, err := os.Stat(pvcBashHistory); os.IsNotExist(err) {
+		if _, hErr := os.Lstat(homeBashHistory); os.IsNotExist(hErr) {
+			_ = os.WriteFile(pvcBashHistory, []byte(""), 0o600)
+		}
+	}
+
+	candidateSet := make(map[string]bool, len(persistentHomeFiles)+16)
+	var candidates []string
+	addCandidate := func(name string) {
+		if shouldIgnoreHomeEntry(name) || !strings.HasPrefix(name, ".") {
+			return
+		}
+		if !candidateSet[name] {
+			candidateSet[name] = true
+			candidates = append(candidates, name)
+		}
+	}
+
+	for _, name := range persistentHomeFiles {
+		addCandidate(name)
+	}
+	if entries, err := os.ReadDir(homeDir); err == nil {
+		for _, entry := range entries {
+			addCandidate(entry.Name())
+		}
+	}
+	if entries, err := os.ReadDir(pvcHome); err == nil {
+		for _, entry := range entries {
+			addCandidate(entry.Name())
+		}
+	}
+
+	for _, name := range candidates {
+		homeFile := filepath.Join(homeDir, name)
+		pvcFile := filepath.Join(pvcHome, name)
+		if !canLinkHomePath(homeDir, workDir, homeFile) {
+			continue
+		}
+
+		fi, err := os.Lstat(homeFile)
+		if os.IsNotExist(err) {
+			if pInfo, pErr := os.Lstat(pvcFile); pErr == nil {
+				if pInfo.IsDir() && !isKnownHomeFile(name) {
+					ensurePersistentDirLink(homeFile, pvcFile, 0o700)
+				} else if !pInfo.IsDir() {
+					_ = os.Symlink(pvcFile, homeFile)
+				}
+			}
+			continue
+		}
+		if err != nil {
+			continue
+		}
+
+		if fi.Mode()&os.ModeSymlink != 0 {
+			dest, lerr := os.Readlink(homeFile)
+			if lerr != nil || filepath.Clean(dest) != filepath.Clean(pvcFile) {
+				if _, pErr := os.Lstat(pvcFile); pErr == nil {
+					_ = os.Remove(homeFile)
+					_ = os.Symlink(pvcFile, homeFile)
+				}
+			}
+			continue
+		}
+
+		if fi.IsDir() {
+			if !isKnownHomeFile(name) {
+				ensurePersistentDirLink(homeFile, pvcFile, fi.Mode().Perm()|0o700)
+			}
+			continue
+		}
+
+		if fi.Mode().IsRegular() {
+			data, rErr := os.ReadFile(homeFile)
+			if rErr == nil {
+				_, pErr := os.Stat(pvcFile)
+				if os.IsNotExist(pErr) || len(bytes.TrimSpace(data)) > 0 {
+					perm := fi.Mode().Perm()
+					if perm == 0 {
+						perm = 0o600
+					}
+					tmpFile := pvcFile + ".orbit-sync-tmp"
+					if wErr := os.WriteFile(tmpFile, data, perm); wErr == nil {
+						_ = os.Chmod(tmpFile, perm)
+						_ = os.Rename(tmpFile, pvcFile)
+					}
+				}
+			}
+			if _, pErr := os.Stat(pvcFile); pErr == nil {
+				_ = os.Remove(homeFile)
+				_ = os.Symlink(pvcFile, homeFile)
+			}
+		}
+	}
 }
 
 func upsertBashrcBlock(existing, block string) string {
@@ -536,58 +880,15 @@ func upsertBashrcBlock(existing, block string) string {
 
 func ensurePersistentLocalDir(homeDir, workDir string) {
 	wsLocal := filepath.Join(workDir, ".orbit", "local")
-	_ = os.MkdirAll(filepath.Join(wsLocal, "bin"), 0o755)
-	_ = os.MkdirAll(filepath.Join(wsLocal, "lib"), 0o755)
-
+	for _, sub := range []string{"bin", "lib", "share", "state"} {
+		_ = os.MkdirAll(filepath.Join(wsLocal, sub), 0o755)
+	}
 	homeLocal := filepath.Join(homeDir, ".local")
-	if fi, err := os.Lstat(homeLocal); os.IsNotExist(err) {
-		if symErr := os.Symlink(wsLocal, homeLocal); symErr != nil {
-			_ = os.MkdirAll(filepath.Join(homeLocal, "bin"), 0o755)
-		}
+	if canLinkHomePath(homeDir, workDir, homeLocal) {
+		ensurePersistentDirLink(homeLocal, wsLocal, 0o755)
 		return
-	} else if err == nil && fi.Mode()&os.ModeSymlink == 0 && fi.IsDir() {
-		homeLocalBin := filepath.Join(homeLocal, "bin")
-		if entries, readErr := os.ReadDir(homeLocalBin); readErr == nil {
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				src := filepath.Join(homeLocalBin, entry.Name())
-				dst := filepath.Join(wsLocal, "bin", entry.Name())
-				if _, statErr := os.Lstat(dst); os.IsNotExist(statErr) {
-					if data, rErr := os.ReadFile(src); rErr == nil {
-						_ = os.WriteFile(dst, data, 0o755)
-					}
-				}
-			}
-		}
-		if entries, readErr := os.ReadDir(homeLocal); readErr == nil && isEffectivelyEmptyLocalDir(homeLocal, entries) {
-			_ = os.RemoveAll(homeLocal)
-			if symErr := os.Symlink(wsLocal, homeLocal); symErr == nil {
-				return
-			}
-		}
 	}
 	_ = os.MkdirAll(filepath.Join(homeLocal, "bin"), 0o755)
-}
-
-func isEffectivelyEmptyLocalDir(homeLocal string, entries []os.DirEntry) bool {
-	for _, entry := range entries {
-		name := entry.Name()
-		if name != "bin" && name != "lib" {
-			return false
-		}
-		subEntries, err := os.ReadDir(filepath.Join(homeLocal, name))
-		if err != nil {
-			return false
-		}
-		for _, sub := range subEntries {
-			if sub.IsDir() {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func buildDirenvTOML(workDir string) string {
@@ -602,6 +903,14 @@ func buildBashrcBlock(homeDir string) string {
 	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
 	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	return fmt.Sprintf(`%s
+export XDG_CONFIG_HOME="%s/.config"
+export XDG_DATA_HOME="%s/.local/share"
+export XDG_STATE_HOME="%s/.local/state"
+export XDG_CACHE_HOME="%s/.cache"
+export HISTFILE="%s/.bash_history"
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+shopt -s histappend 2>/dev/null || true
 export NPM_CONFIG_PREFIX="%s/.local"
 export PATH="%s/.local/bin:%s/.nix-profile/bin:/nix/var/nix/profiles/per-user/orbit/profile/bin:/nix/var/nix/profiles/orbit/bin:/usr/local/bin:$PATH"
 export STARSHIP_CONFIG=%q
@@ -627,5 +936,5 @@ if [[ $- == *i* ]]; then
   printf '\033[2m──────────────────────────────────────────────────────────────────────\033[0m\n\n'
 fi
 %s
-`, bashrcMarkerStart, homeDir, homeDir, homeDir, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
+`, bashrcMarkerStart, homeDir, homeDir, homeDir, homeDir, homeDir, homeDir, homeDir, homeDir, starshipCfg, sshCmd, envSh, envSh, bashrcMarkerEnd)
 }

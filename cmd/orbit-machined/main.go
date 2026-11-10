@@ -151,10 +151,14 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 			if store, storeErr := storage.NewHTTPObjectStore(cfg.S3Endpoint, nil); storeErr == nil {
 				if v, vErr := storage.NewProfileVault(store, cfg.S3ProfileBucket, cfg.ProfileEncryptionKey); vErr == nil {
 					vault = v
-					_, _ = vault.HydrateProfile(ctx, cfg.MachineID, homeDir)
+					if _, statErr := os.Stat(filepath.Join(cfg.WorkDir, ".orbit", "home")); os.IsNotExist(statErr) {
+						_, _ = vault.HydrateProfile(ctx, cfg.MachineID, homeDir)
+					}
 				}
 			}
 		}
+
+		shellinit.SyncPersistentHomeFiles(homeDir, cfg.WorkDir)
 
 		mgr, _ := helper.NewManager(helper.Config{
 			HomeDir:       homeDir,
@@ -179,12 +183,27 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 			_, _ = mgr.AutoloadAllWorkspaceFlakes(ctx)
 		}
 
+		shellinit.SyncPersistentHomeFiles(homeDir, cfg.WorkDir)
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					shellinit.SyncPersistentHomeFiles(homeDir, cfg.WorkDir)
+				}
+			}
+		}()
+
 		wsSrv, err := tui.NewWSServer(tui.WSServerConfig{
 			WorkspaceDir: cfg.WorkDir,
 			ShellSpawner: func(spawnCtx context.Context, tabID string, cols, rows int) (*pty.Pane, error) {
 				return spawnShellPane(spawnCtx, homeDir, cfg.WorkDir, tabID, "Starship Shell ("+tabID+")", cols, rows), nil
 			},
 			OnSnapshot: func(snapCtx context.Context) ([]string, error) {
+				shellinit.SyncPersistentHomeFiles(homeDir, cfg.WorkDir)
 				if vault != nil {
 					_ = vault.SnapshotProfile(snapCtx, cfg.MachineID, homeDir)
 				}
@@ -227,6 +246,7 @@ func defaultServeRunner(logOut io.Writer) func(context.Context, config.MachinedC
 		case <-ctx.Done():
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			shellinit.SyncPersistentHomeFiles(homeDir, cfg.WorkDir)
 			if vault != nil {
 				_ = vault.SnapshotProfile(shutCtx, cfg.MachineID, homeDir)
 			}
@@ -293,6 +313,13 @@ func spawnShellPane(ctx context.Context, homeDir, workDir, id, title string, col
 	}
 	env := append(os.Environ(),
 		"HOME="+homeDir,
+		"XDG_CONFIG_HOME="+filepath.Join(homeDir, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(homeDir, ".local", "share"),
+		"XDG_STATE_HOME="+filepath.Join(homeDir, ".local", "state"),
+		"XDG_CACHE_HOME="+filepath.Join(homeDir, ".cache"),
+		"HISTFILE="+filepath.Join(homeDir, ".bash_history"),
+		"HISTSIZE=10000",
+		"HISTFILESIZE=20000",
 		"STARSHIP_CONFIG="+filepath.Join(homeDir, ".config", "starship.toml"),
 		"TERM=xterm-256color",
 		"COLORTERM=truecolor",

@@ -349,7 +349,9 @@ func (m *Manager) SaveState(st State) error {
 	raw, _ := json.MarshalIndent(st, "", "  ")
 	_ = writeConfigFile(filepath.Join(m.configDir, "helper-state.json"), raw, 0o600)
 	_ = writeConfigFile(filepath.Join(m.workDir, ".orbit", "state.json"), raw, 0o600)
-	return writeConfigFile(filepath.Join(m.configDir, "state.json"), raw, 0o600)
+	err := writeConfigFile(filepath.Join(m.configDir, "state.json"), raw, 0o600)
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
+	return err
 }
 
 // ConfigureGit writes ~/.gitconfig with the given identity and default branch and persists it in State.
@@ -379,6 +381,7 @@ func (m *Manager) ConfigureGit(name, email, defaultBranch string) error {
 	if err := m.SaveState(st); err != nil {
 		return err
 	}
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
 	m.triggerSnapshot()
 	return nil
 }
@@ -440,6 +443,7 @@ func (m *Manager) EnsureGitAndSSH() error {
 		_ = m.SaveState(st)
 	}
 	m.syncConfigurationNix()
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
 	return nil
 }
 
@@ -1040,7 +1044,6 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 		case "agy":
 			for _, p := range []string{
 				filepath.Join(m.homeDir, ".gemini", "config", "mcp_config.json"),
-				filepath.Join(m.homeDir, ".gemini", "antigravity-cli", "settings.json"),
 				filepath.Join(m.homeDir, ".gemini", "settings.json"),
 				filepath.Join(m.homeDir, ".config", "antigravity", "mcp.json"),
 			} {
@@ -1070,13 +1073,19 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 				return configured, err
 			}
 		case "aider":
-			if err := writeConfigFile(filepath.Join(m.homeDir, ".aider.conf.yml"), []byte("auto-commits: false\n"), 0o600); err != nil {
-				return configured, err
+			aiderConf := filepath.Join(m.homeDir, ".aider.conf.yml")
+			if _, statErr := os.Stat(aiderConf); os.IsNotExist(statErr) {
+				if err := writeConfigFile(aiderConf, []byte("auto-commits: false\n"), 0o600); err != nil {
+					return configured, err
+				}
 			}
 		case "gh":
-			ghYML := []byte("git_protocol: ssh\neditor: vim\nprompt: enabled\n")
-			if err := writeConfigFile(filepath.Join(m.homeDir, ".config", "gh", "config.yml"), ghYML, 0o600); err != nil {
-				return configured, err
+			ghConf := filepath.Join(m.homeDir, ".config", "gh", "config.yml")
+			if _, statErr := os.Stat(ghConf); os.IsNotExist(statErr) {
+				ghYML := []byte("git_protocol: ssh\neditor: vim\nprompt: enabled\n")
+				if err := writeConfigFile(ghConf, ghYML, 0o600); err != nil {
+					return configured, err
+				}
 			}
 		case "git":
 			name, email, branch := m.defaultGitIdentity(st, orbitCtx)
@@ -1096,6 +1105,7 @@ func (m *Manager) ConfigureToolsWithContext(ctx context.Context, selected []stri
 
 	_ = m.SaveState(st)
 	_ = m.writeEnvSh(orbitCtx)
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
 	m.triggerSnapshot()
 	return configured, nil
 }
@@ -1112,7 +1122,9 @@ func isSupportedToolName(tool string) bool {
 func mergeMCPServerIntoJSONFile(path string, orbitServerSpec map[string]any, defaults map[string]any) error {
 	doc := make(map[string]any)
 	if existing, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(existing)) > 0 {
-		_ = json.Unmarshal(existing, &doc)
+		if err := json.Unmarshal(existing, &doc); err != nil {
+			return nil
+		}
 	}
 	for k, v := range defaults {
 		if _, exists := doc[k]; !exists {
@@ -1163,6 +1175,7 @@ func (m *Manager) Save(ctx context.Context) error {
 	_ = m.SaveContext(orbitCtx)
 	st, _ := m.LoadState()
 	_ = m.SaveState(st)
+	shellinit.SyncPersistentHomeFiles(m.homeDir, m.workDir)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.machinedURL+"/api/v1/snapshot", nil)
 	if err == nil {
@@ -1693,6 +1706,13 @@ func (m *Manager) writeEnvSh(ctxData OrbitContext) error {
 	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", sshKeyPath, knownHostsPath)
 	b.WriteString("export GIT_TERMINAL_PROMPT=0\n")
 	_, _ = fmt.Fprintf(&b, "export GIT_SSH_COMMAND=%q\n", sshCmd)
+	_, _ = fmt.Fprintf(&b, "export XDG_CONFIG_HOME=%q\n", filepath.Join(m.homeDir, ".config"))
+	_, _ = fmt.Fprintf(&b, "export XDG_DATA_HOME=%q\n", filepath.Join(m.homeDir, ".local", "share"))
+	_, _ = fmt.Fprintf(&b, "export XDG_STATE_HOME=%q\n", filepath.Join(m.homeDir, ".local", "state"))
+	_, _ = fmt.Fprintf(&b, "export XDG_CACHE_HOME=%q\n", filepath.Join(m.homeDir, ".cache"))
+	_, _ = fmt.Fprintf(&b, "export HISTFILE=%q\n", filepath.Join(m.homeDir, ".bash_history"))
+	b.WriteString("export HISTSIZE=10000\n")
+	b.WriteString("export HISTFILESIZE=20000\n")
 	_, _ = fmt.Fprintf(&b, "export NPM_CONFIG_PREFIX=%q\n", filepath.Join(m.homeDir, ".local"))
 	_, _ = fmt.Fprintf(&b, "export PATH=\"%s/.local/bin:%s/.nix-profile/bin:$PATH\"\n", m.homeDir, m.homeDir)
 	for _, kv := range [][2]string{

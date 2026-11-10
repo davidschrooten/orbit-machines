@@ -117,6 +117,38 @@ func TestProfileVault_SnapshotAndHydrateRoundTrip(t *testing.T) {
 	if _, err := vault.HydrateProfile(ctx, otherMID, t.TempDir()); !errors.Is(err, storage.ErrDecryptionFailed) {
 		t.Fatalf("expected ErrDecryptionFailed on cross-user AAD mismatch, got %v", err)
 	}
+
+	// 5. Symlinked home directories & top-level files (as created by shellinit.EnsureInitialized) are followed by SnapshotProfile!
+	symHome := filepath.Join(t.TempDir(), "sym-home")
+	pvcHome := filepath.Join(t.TempDir(), "pvc-home")
+	_ = os.MkdirAll(symHome, 0o755)
+	_ = os.MkdirAll(filepath.Join(pvcHome, ".claude", "projects", "repo1"), 0o700)
+	_ = os.MkdirAll(filepath.Join(pvcHome, ".gemini", "antigravity-cli", "conversations"), 0o700)
+	_ = os.WriteFile(filepath.Join(pvcHome, ".claude", "projects", "repo1", "chat.jsonl"), []byte("{\"msg\":\"hi\"}\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(pvcHome, ".claude.json"), []byte(`{"oauthAccount":{"emailAddress":"dev@acme.dev"}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(pvcHome, ".gemini", "antigravity-cli", "conversations", "c1.pb"), []byte("PB_DATA"), 0o600)
+	_ = os.Symlink(filepath.Join(pvcHome, ".claude"), filepath.Join(symHome, ".claude"))
+	_ = os.Symlink(filepath.Join(pvcHome, ".claude.json"), filepath.Join(symHome, ".claude.json"))
+	_ = os.Symlink(filepath.Join(pvcHome, ".gemini"), filepath.Join(symHome, ".gemini"))
+
+	symMID, _ := domain.NewMachineID("ws_sym", "usr_sym")
+	if err := vault.SnapshotProfile(ctx, symMID, symHome); err != nil {
+		t.Fatalf("SnapshotProfile(symHome): %v", err)
+	}
+	hydratedSymHome := t.TempDir()
+	if ok, err := vault.HydrateProfile(ctx, symMID, hydratedSymHome); err != nil || !ok {
+		t.Fatalf("HydrateProfile(symMID) = (%v, %v)", ok, err)
+	}
+	for rel, want := range map[string]string{
+		".claude/projects/repo1/chat.jsonl":            "{\"msg\":\"hi\"}\n",
+		".claude.json":                                 `{"oauthAccount":{"emailAddress":"dev@acme.dev"}}`,
+		".gemini/antigravity-cli/conversations/c1.pb": "PB_DATA",
+	} {
+		got, err := os.ReadFile(filepath.Join(hydratedSymHome, rel))
+		if err != nil || string(got) != want {
+			t.Fatalf("hydrated symlinked %s = (%q, %v), want %q", rel, string(got), err, want)
+		}
+	}
 }
 
 func TestProfileVault_ZipSlipAndValidation(t *testing.T) {
